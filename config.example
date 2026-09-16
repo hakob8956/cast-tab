@@ -1,0 +1,2 @@
+# ~/.config/cast-tab/config — sourced by cast-tab
+CAST_TV=192.168.1.50          # TV IP (or Cast name); find it with: catt scan

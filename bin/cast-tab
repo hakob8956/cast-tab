@@ -1,0 +1,96 @@
+#!/bin/bash
+# cast-tab — play the video from the front browser's active tab (or a URL) on the Samsung TV via Google Cast.
+# Usage: cast-tab            video in the front tab → TV, starting where the page is; page video pauses
+#        cast-tab <url>      cast any URL (yt-dlp sites: YouTube, Vimeo, …)
+#        cast-tab clip       cast the URL in the clipboard
+#        cast-tab back       stop the TV and continue in the page from the TV position
+#        cast-tab toggle | play | pause | stop | status | info | skip
+#        cast-tab rewind [s] | ffwd [s] | seek <s> | volume <0-100> | volumeup [d] | volumedown [d] | volumemute
+#
+# How a tab is cast: 1) yt-dlp (via catt) for sites it knows; 2) otherwise the stream the page's player loaded is read
+# from the tab (tab-media) and cast directly, with the subtitle track if one was loaded. Page-player sites listed in
+# PAGE_PLAYER_SITES skip step 1. Only the video plays on the TV — Mac screen untouched, full quality.
+
+CONFIG="$HOME/.config/cast-tab/config"; [ -f "$CONFIG" ] && . "$CONFIG"   # CAST_TV=<ip or name> (from: catt scan)
+TV="${CAST_TV:-}"; [ -z "$TV" ] && { echo "No TV configured — put CAST_TV=<ip> in $CONFIG (find it with: catt scan)"; exit 1; }
+CATT="${CATT:-$(command -v catt || echo "$HOME/.local/bin/catt")}"
+TABMEDIA="${TABMEDIA:-$(command -v tab-media || echo "$HOME/.local/bin/tab-media")}"
+PAGE_PLAYER_SITES='rezka\.|hdrezka|voidboost|voidviral|kinogo|lordfilm'   # yt-dlp can't do these → go straight to the tab
+BROWSERS='^(Arc|Google Chrome|Brave Browser|Microsoft Edge|Chromium|Vivaldi)$'
+
+catt() { "$CATT" -d "$TV" "$@" 2>&1 | grep -v "Failed to determine cast type"; return "${PIPESTATUS[0]}"; }
+
+tv_time() { "$CATT" -d "$TV" status 2>/dev/null | awk '/^Time:/{split($2,t,":"); print t[1]*3600+t[2]*60+t[3]}'; }
+
+wait_for_tv() {   # the TV's Cast service goes away for a minute or two after a session ends
+  local i; for i in $(seq 1 30); do
+    nc -z -w 2 "$TV" 8009 >/dev/null 2>&1 && return 0
+    [ "$i" -eq 1 ] && echo "TV Cast service restarting — waiting…"
+    sleep 3
+  done; echo "TV not reachable on port 8009 (is it on?)"; return 1
+}
+
+case "$1" in
+  stop|pause|play|status|info|skip|volumemute) catt "$1"; exit ;;
+  toggle)                 catt play_toggle; exit ;;
+  rewind|ffwd|seek)       catt "$1" "${2:-10}"; exit ;;      # seconds (default 10)
+  volume)                 catt volume "${2:-50}"; exit ;;    # 0-100
+  volumeup|volumedown)    catt "$1" "${2:-10}"; exit ;;      # step (default 10)
+  back)
+    T=$(tv_time); [ -z "$T" ] && { echo "Nothing playing on TV"; exit 1; }
+    "$CATT" -d "$TV" stop >/dev/null 2>&1
+    R=$("$TABMEDIA" seek "$T"); [ "$R" = ok ] && echo "Back on Mac at $((T/60))m$((T%60))s" || echo "TV stopped (no video in the front tab to resume)"
+    exit 0 ;;
+  clip) set -- "$(pbpaste | head -n1 | tr -d '[:space:]')"; echo "$1" | grep -qE '^https?://' || { echo "Clipboard has no URL"; exit 1; } ;;
+esac
+
+APP=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true')
+echo "$APP" | grep -qE "$BROWSERS" || APP=Arc     # terminal/Raycast in front → assume Arc
+
+FROM_TAB=0
+if [ -n "$1" ]; then PAGE="$1"
+else
+  PAGE=$(osascript -e "tell application \"$APP\" to get URL of active tab of front window"); FROM_TAB=1
+fi
+[ -z "$PAGE" ] && { echo "No browser tab URL found"; exit 1; }
+HOST=$(echo "$PAGE" | awk -F/ '{print $3}')
+echo "Casting: $PAGE"
+
+wait_for_tv || exit 1
+
+# where the page is right now (only when casting the front tab)
+SEEK=(); TITLE=()
+if [ "$FROM_TAB" -eq 1 ]; then
+  INFO=$("$TABMEDIA" info "$APP")
+  T=$(echo "$INFO" | sed -n 's/^time=//p'); TT=$(echo "$INFO" | sed -n 's/^title=//p')
+  [ -n "$T" ] && [ "$T" -gt 5 ] && SEEK=(-t "$T")
+fi
+
+# 1) yt-dlp sites
+if ! echo "$HOST" | grep -qiE "$PAGE_PLAYER_SITES"; then
+  if catt cast "${SEEK[@]}" "$PAGE" | tail -n 2; then
+    [ "$FROM_TAB" -eq 1 ] && "$TABMEDIA" pause "$APP" >/dev/null
+    exit 0
+  fi
+  [ "$FROM_TAB" -eq 0 ] && exit 1
+  echo "Not a yt-dlp site — reading the stream from the $APP tab…"
+fi
+
+# 2) stream straight from the page's player
+[ "$FROM_TAB" -eq 0 ] && { echo "This site must be open in the browser: open it, then run cast-tab without a URL."; exit 1; }
+pick() { STREAM=$(echo "$MEDIA" | grep -iE 'manifest\.m3u8|\.m3u8(\?|$)' | head -n1)
+         [ -z "$STREAM" ] && STREAM=$(echo "$MEDIA" | grep -iE '\.(mp4|webm|mpd)(\?|$)' | head -n1)
+         SUBS=$(echo "$MEDIA" | grep -iE '\.(vtt|srt)(\?|$)' | head -n1); }
+MEDIA=$("$TABMEDIA" urls "$APP"); pick
+if [ -z "$STREAM" ]; then
+  echo "No stream loaded yet — starting the page video…"
+  "$TABMEDIA" play "$APP" >/dev/null
+  for i in 1 2 3 4 5 6 7 8; do sleep 1; MEDIA=$("$TABMEDIA" urls "$APP"); pick; [ -n "$STREAM" ] && break; done
+  [ -z "$STREAM" ] && { echo "No stream found in the tab (DRM or player in an iframe?). Press play in the page and retry."; exit 1; }
+  INFO=$("$TABMEDIA" info "$APP"); TT=$(echo "$INFO" | sed -n 's/^title=//p'); SEEK=()
+fi
+[ -n "$TT" ] && TITLE=(-l "$TT")
+
+"$TABMEDIA" pause "$APP" >/dev/null
+echo "Stream: ${STREAM:0:90}…"; [ -n "$SUBS" ] && echo "Subtitles: ${SUBS:0:90}…"
+catt cast ${SUBS:+-s "$SUBS"} "${TITLE[@]}" "${SEEK[@]}" "$STREAM" | tail -n 1

@@ -1,0 +1,47 @@
+#!/bin/bash
+# tab-media — talk to the front browser tab's video player (AppleScript + JS).
+# Usage: tab-media urls  [App]     media URLs the player loaded (m3u8/mp4/mpd/webm/vtt/srt), NEWEST FIRST, one per line
+#        tab-media info  [App]     time=<sec> duration=<sec> paused=<0|1> title=<show · season · episode>
+#        tab-media play  [App]     start the page's main video
+#        tab-media pause [App]     pause it
+#        tab-media seek <sec> [App]  jump to position and play
+# App: Arc (default) / Google Chrome / Brave Browser / Microsoft Edge. Chrome-family needs
+# View → Developer → "Allow JavaScript from Apple Events". Player must be in the page itself, not a cross-origin iframe.
+#
+# urls: newest-first matters for sites that switch episodes without a page reload (rezka etc.). A PerformanceObserver
+# is installed in the page on first call so later streams are still caught after the browser's resource-timing
+# buffer (250 entries) fills up with video segments.
+
+CMD="${1:-urls}"; [ $# -gt 0 ] && shift
+SEC=""; [ "$CMD" = seek ] && { SEC="$1"; shift; }
+APP="${1:-Arc}"
+
+# main video = largest <video> on the page
+V='const v=[...document.querySelectorAll("video")].sort((a,b)=>b.clientWidth*b.clientHeight-a.clientWidth*a.clientHeight)[0];'
+# title = h1 (or page title) + active season/episode (rezka-style ".active" items), max 90 chars
+T='const T=()=>{const c=s=>{const e=document.querySelector(s);return e?e.textContent:""};let t=(c("h1")||document.title).replace(/\s+/g," ").trim();const se=c(".b-simple_season__item.active").trim(),ep=c(".b-simple_episode__item.active").trim();if(se)t+=" · "+se;if(ep)t+=" · "+ep;return t.slice(0,90)};'
+
+case "$CMD" in
+  urls) JS='(()=>{const re=/\.(m3u8|mp4|mpd|webm|vtt|srt)(\?|$)|:hls:manifest\.m3u8/i;const w=window;w.__ct=w.__ct||{seen:[]};
+if(!w.__ct.obs){try{w.__ct.obs=new PerformanceObserver(l=>l.getEntries().forEach(e=>{if(re.test(e.name))w.__ct.seen.push([e.startTime,e.name])}));w.__ct.obs.observe({type:"resource",buffered:true})}catch(e){}}
+try{performance.setResourceTimingBufferSize(20000)}catch(e){}
+const all=[...w.__ct.seen];
+performance.getEntriesByType("resource").forEach(e=>{if(re.test(e.name))all.push([e.startTime,e.name])});
+document.querySelectorAll("video,source,track").forEach(v=>{[v.currentSrc,v.src].forEach(s=>{if(s&&!s.startsWith("blob:"))all.push([1e12,s])})});
+all.sort((a,b)=>b[0]-a[0]);const out=[],seen=new Set();
+for(const [,n] of all){if(re.test(n)&&!seen.has(n)){seen.add(n);out.push(n)}}
+return out.join("\n")})()' ;;
+  info)  JS="(()=>{${T}${V}return \"time=\"+(v?Math.floor(v.currentTime):\"\")+\"\\nduration=\"+(v?Math.floor(v.duration||0):\"\")+\"\\npaused=\"+(v?(v.paused?1:0):\"\")+\"\\ntitle=\"+T()})()" ;;
+  play)  JS="(()=>{${V}if(!v)return \"novideo\";v.muted=false;const p=v.play();if(p&&p.catch)p.catch(()=>{});return \"ok\"})()" ;;
+  pause) JS="(()=>{${V}if(!v)return \"novideo\";v.pause();return \"ok\"})()" ;;
+  seek)  JS="(()=>{${V}if(!v)return \"novideo\";v.currentTime=${SEC:-0};const p=v.play();if(p&&p.catch)p.catch(()=>{});return \"ok\"})()" ;;
+  *) echo "usage: tab-media urls|info|play|pause|seek <sec> [App]" >&2; exit 2 ;;
+esac
+
+# app name must be literal in the script (AppleScript needs the app's dictionary at compile time); JS passed as argv.
+# osascript quotes the result and escapes newlines/quotes → undo that.
+osascript - "$JS" <<EOS 2>/dev/null | perl -pe 's/^"//; s/"\s*$//; s/\\n/\n/g; s/\\"/"/g'
+on run {js}
+  tell application "$APP" to execute active tab of front window javascript js
+end run
+EOS
