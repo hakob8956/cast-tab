@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+# cast-ctl — fast remote for the TV's current Cast session (run with catt's python: it has pychromecast).
+# Usage: cast-ctl <tv-ip> status | time | toggle | play | pause | stop | skip
+#                        rewind [s] | ffwd [s] | seek <s> | volume <0-100> | volumeup [d] | volumedown [d] | volumemute
+#        cast-ctl <tv-ip> watch     stay with the video just cast: log what the TV does, reload it if the player fails
+#
+# catt looks the TV up over HTTP on every call (/setup/eureka_info + cast-type probe, ~1 s each on Samsung) before it
+# opens the Cast socket, so every hotkey took ~2.5 s. This connects straight to port 8009 instead (~0.1 s).
+import os
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+import pychromecast
+from pychromecast.config import APP_MEDIA_RECEIVER
+from pychromecast.models import CastInfo, HostServiceInfo
+
+MEDIA_NS = "urn:x-cast:com.google.cast.media"
+LOG = os.path.expanduser("~/Library/Logs/cast-tab.log")
+
+
+def die(msg):
+    print(msg)
+    sys.exit(1)
+
+
+def hms(sec):
+    sec = int(sec or 0)
+    return "%d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60) if sec >= 3600 else "%d:%02d" % (sec // 60, sec % 60)
+
+
+class MediaWaiter:
+    """Set on the next media status (or load failure) from the TV."""
+
+    def __init__(self):
+        self.event = threading.Event()
+
+    def new_media_status(self, status):
+        self.event.set()
+
+    def load_media_failed(self, queue_item_id, error_code):
+        self.event.set()
+
+    def wait(self, timeout=3):
+        ok = self.event.wait(timeout)
+        self.event.clear()
+        return ok
+
+
+def connect(ip, tries=1):
+    info = CastInfo({HostServiceInfo(ip, 8009)}, uuid.uuid5(uuid.NAMESPACE_URL, "cast-tab:" + ip),
+                    "Cast TV", ip, ip, 8009, "cast", "Unknown")
+    cc = pychromecast.get_chromecast_from_cast_info(info, None, tries=tries, retry_wait=5, timeout=5)
+    try:
+        cc.wait(timeout=6)
+    except Exception:
+        die("TV not reachable on %s:8009 (is it on?)" % ip)
+    return cc
+
+
+def main():
+    if len(sys.argv) < 3:
+        die("usage: cast-ctl <tv-ip> <command> [arg]")
+    ip, cmd, arg = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else None)
+    cc = connect(ip, tries=None if cmd == "watch" else 1)   # the watcher reconnects after Wi-Fi blips
+    try:
+        watch(cc) if cmd == "watch" else run(cc, cmd, arg)
+    finally:
+        cc.disconnect(timeout=2)
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+
+
+def notify(msg):
+    subprocess.run(["osascript", "-e", 'display notification "%s" with title "Cast TV"' % msg.replace('"', "'")],
+                   capture_output=True)
+
+
+class StateLogger:
+    """Logs every player state change the TV pushes (buffering included), and load failures."""
+
+    def __init__(self):
+        self.last = None
+        self.load_failed = False
+
+    def new_media_status(self, s):
+        reason = s.idle_reason if s.player_state == "IDLE" else None   # pychromecast keeps the last one around
+        key = (s.player_state, reason)
+        if key != self.last:
+            log("  %s%s at %s" % (s.player_state, " (%s)" % reason if reason else "", hms(s.adjusted_current_time)))
+            self.last = key
+
+    def load_media_failed(self, queue_item_id, error_code):
+        log("  load failed, error %s" % error_code)
+        self.load_failed = True
+
+
+class ConnLogger:
+    def new_connection_status(self, s):
+        log("  TV connection %s" % s.status)
+
+
+def watch(cc):
+    """Stay with the video cast-tab just started, until it ends or something else is cast. Logs to LOG what the TV
+    does, so a stop in the middle shows why (player error / buffering / TV closed the player / connection lost).
+    On a player error (never caused by the user) the video is loaded again at the last position, up to 3 times."""
+    if os.path.exists(LOG) and os.path.getsize(LOG) > 1_000_000:
+        with open(LOG) as f:
+            keep = f.readlines()[-3000:]
+        with open(LOG, "w") as f:
+            f.writelines(keep)
+
+    mc = cc.media_controller
+    waiter, states = MediaWaiter(), StateLogger()
+    mc.register_status_listener(waiter)
+    mc.register_status_listener(states)
+    cc.register_connection_listener(ConnLogger())
+
+    def poll():
+        if cc.socket_client.is_connected and cc.status and cc.status.app_id == APP_MEDIA_RECEIVER:
+            mc.update_status()
+            waiter.wait()
+        return mc.status
+
+    for _ in range(12):   # cast-tab starts us right after the LOAD; give the player up to 30 s to start
+        s = poll()
+        if s.content_id and s.player_state in ("PLAYING", "PAUSED", "BUFFERING"):
+            break
+        time.sleep(2.5)
+    else:
+        return log("watch: nothing playing on the TV's media player, not watching")
+
+    url, ctype, title, duration = s.content_id, s.content_type, s.title, s.duration or 0
+    subs = next((t for t in s.subtitle_tracks if t.get("type") == "TEXT" and t.get("trackId") in s.current_subtitle_tracks),
+                None)
+    log("watching %s  [%s … %s]" % (title or "", url[:40], url[-40:]))
+
+    pos, stuck_since, lost_since, reloads, grace_until = s.adjusted_current_time or 0, None, None, [], 0
+    while True:
+        time.sleep(5)
+        if not cc.socket_client.is_connected:
+            lost_since = lost_since or time.time()
+            if time.time() - lost_since > 600:
+                return log("TV unreachable for 10 min (off?) — stop watching")
+            continue
+        lost_since = None
+        if not cc.status or cc.status.app_id != APP_MEDIA_RECEIVER:
+            return log("player closed on the TV at %s (app now: %s) — Back/Home on the remote, or the TV closed it"
+                       % (hms(pos), cc.status.display_name if cc.status else None))
+        s = poll()
+        if s.content_id and s.content_id != url:
+            return log("something else was cast — stop watching")
+
+        if s.player_state in ("PLAYING", "PAUSED", "BUFFERING"):
+            now = s.adjusted_current_time or pos
+            if s.player_state == "PLAYING" and now - pos < 1:   # "playing" but the picture doesn't move
+                if not stuck_since:
+                    stuck_since = time.time()
+                    log("  frozen: PLAYING but position stuck at %s" % hms(now))
+            elif stuck_since and now - pos >= 1:
+                log("  unfrozen after %ds" % (time.time() - stuck_since))
+                stuck_since = None
+            pos = now
+            continue
+
+        if s.player_state != "IDLE" or time.time() < grace_until:
+            continue
+        if s.idle_reason == "FINISHED" or (duration and pos > duration - 30):
+            return log("finished")
+        if s.idle_reason != "ERROR" and not states.load_failed:
+            return log("stopped (%s) at %s" % (s.idle_reason, hms(pos)))
+
+        reloads = [t for t in reloads if time.time() - t < 900]
+        if len(reloads) >= 3:
+            notify("TV player keeps failing — gave up at %s" % hms(pos))
+            return log("player failed 3 times in 15 min — giving up at %s" % hms(pos))
+        at = max(0, pos - 5)
+        log("player error at %s — loading the video again at %s" % (hms(pos), hms(at)))
+        notify("TV player failed — resuming at %s" % hms(at))
+        states.load_failed = False
+        reloads.append(time.time())
+        grace_until = time.time() + 30
+        mc.play_media(url, ctype, title=title, current_time=at, stream_type="BUFFERED",
+                      subtitles=subs["trackContentId"] if subs else None,
+                      subtitles_lang=(subs or {}).get("language", "en-US"),
+                      subtitles_mime=(subs or {}).get("trackContentType", "text/vtt"))
+
+
+def run(cc, cmd, arg):
+    # volume lives on the receiver, works whatever app is running
+    if cmd == "volume":
+        cc.set_volume(max(0, min(100, int(arg or 50))) / 100)
+        return print("🔊 %d" % round(cc.status.volume_level * 100))
+    if cmd in ("volumeup", "volumedown"):
+        d = int(arg or 10) / 100
+        level = cc.volume_up(d) if cmd == "volumeup" else cc.volume_down(d)
+        return print("%s %d" % ("🔊" if cmd == "volumeup" else "🔉", round(level * 100)))
+    if cmd == "volumemute":
+        muted = not cc.status.volume_muted
+        cc.set_volume_muted(muted)
+        return print("🔇 muted" if muted else "🔈 unmuted")
+
+    app = cc.status.app_id if cc.status else None
+    if not app or app == pychromecast.config.APP_BACKDROP:
+        die("Nothing playing on TV")
+    if cmd == "stop":
+        cc.quit_app()
+        return print("⏹ stopped")
+    if MEDIA_NS not in (cc.status.namespaces or []):
+        die("TV app %s has no media controls" % cc.status.display_name)
+
+    mc = cc.media_controller
+    waiter = MediaWaiter()
+    mc.register_status_listener(waiter)
+    mc.update_status()
+    if not waiter.wait():
+        die("TV did not answer")
+    s = mc.status
+    if s.player_state in (None, "UNKNOWN", "IDLE") or s.media_session_id is None:
+        die("Nothing playing on TV" + (" (last: %s)" % s.idle_reason if s.idle_reason else ""))
+
+    seekable = bool(s.duration) and s.stream_type == "BUFFERED"
+    pos = s.adjusted_current_time or 0
+
+    def seek(to):
+        if not seekable:
+            die("Stream is not seekable")
+        to = max(0, min(to, s.duration - 5))
+        # no resumeState → a paused video stays paused (pychromecast's seek() always resumes)
+        mc._send_command({"type": "SEEK", "currentTime": to}, None)
+        waiter.wait()
+        return to
+
+    if cmd == "time":
+        print(int(pos))
+    elif cmd == "status":
+        title = (s.title or "").strip()
+        if title:
+            print(title)
+        print("%s  %s / %s" % ({"PLAYING": "▶", "PAUSED": "⏸", "BUFFERING": "⏳"}.get(s.player_state, s.player_state),
+                               hms(pos), hms(s.duration)))
+        print("Volume %d%s" % (round(cc.status.volume_level * 100), " (muted)" if cc.status.volume_muted else ""))
+    elif cmd in ("toggle", "play", "pause"):
+        if cmd == "play" or (cmd == "toggle" and s.player_state == "PAUSED"):
+            mc.play()
+            print("▶ %s" % hms(pos))
+        else:
+            mc.pause()
+            print("⏸ %s" % hms(pos))
+    elif cmd in ("rewind", "ffwd"):
+        d = int(arg or 10)
+        print("%s %s" % ("⏪" if cmd == "rewind" else "⏩", hms(seek(pos - d if cmd == "rewind" else pos + d))))
+    elif cmd == "seek":
+        print("↪ %s" % hms(seek(int(arg or 0))))
+    elif cmd == "skip":
+        seek(s.duration)
+        print("⏭ skipped")
+    else:
+        die("unknown command: %s" % cmd)
+
+
+if __name__ == "__main__":
+    main()

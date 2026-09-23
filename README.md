@@ -67,13 +67,16 @@ tab-media urls|info|play|pause|seek <s> [App]   # low-level: talk to the tab's v
 ```
 
 ## Troubleshooting
+- Video stopped in the middle — see `~/Library/Logs/cast-tab.log`: `player error` (reloaded automatically), `frozen`/`BUFFERING` (network), `player closed on the TV` (remote or TV closed it), `TV connection LOST`.
 - `TV Cast service restarting — waiting…` — Samsung drops its Cast service for 1–2 min after a session ends; the script waits up to 90 s.
 - `No stream found in the tab` — DRM, iframe player, or the video never started. Press play in the page and retry.
 - TV shows black/error on a page-player site — the CDN refused the TV (needs cookies/referer). Nothing to do.
 - `Failed to determine cast type` warnings from catt are harmless (Samsung lacks one Chromecast info endpoint); the scripts filter them.
+- Remote commands are instant only with an IP in `CAST_TV`; with a Cast name they go through catt (~2.5 s each, it looks the TV up over HTTP every call).
 
 ## Files
 - `bin/cast-tab` — main command
 - `bin/tab-media` — AppleScript/JS bridge to the browser tab's player
+- `bin/cast-ctl` — fast remote (play/pause/seek/volume/status) over a direct Cast socket; used by cast-tab when `CAST_TV` is an IP. `cast-ctl <ip> watch` runs in the background after each cast: logs what the TV does to `~/Library/Logs/cast-tab.log` and reloads the video at the last position if the TV's player fails
 - `raycast/*.sh` — Raycast script commands (thin wrappers around cast-tab)
 - `install.sh`, `config.example`

@@ -20,7 +20,25 @@ BROWSERS='^(Arc|Google Chrome|Brave Browser|Microsoft Edge|Chromium|Vivaldi)$'
 
 catt() { "$CATT" -d "$TV" "$@" 2>&1 | grep -v "Failed to determine cast type"; return "${PIPESTATUS[0]}"; }
 
-tv_time() { "$CATT" -d "$TV" status 2>/dev/null | awk '/^Time:/{split($2,t,":"); print t[1]*3600+t[2]*60+t[3]}'; }
+# remote-control commands go through cast-ctl: direct socket to the TV, ~0.2 s (catt looks the TV up over HTTP
+# first, ~2.5 s per call). It needs an IP and catt's python (has pychromecast); with a Cast name in CAST_TV → catt.
+CTL="$(dirname "$(readlink -f "$0")")/cast-ctl"
+CATT_PY=$(head -n1 "$CATT" 2>/dev/null | sed -n 's/^#!//p')
+if [[ "$TV" =~ ^[0-9.]+$ ]] && [ -x "$CATT_PY" ] && [ -f "$CTL" ]; then
+  ctl() { "$CATT_PY" "$CTL" "$TV" "$@" 2>/dev/null; }
+  # after a cast: stay connected, log to ~/Library/Logs/cast-tab.log, reload the video if the TV's player fails
+  watch_tv()   { unwatch_tv; nohup "$CATT_PY" "$CTL" "$TV" watch </dev/null >/dev/null 2>&1 & }
+  unwatch_tv() { pkill -f "cast-ctl $TV watch" 2>/dev/null; }
+else
+  watch_tv() { :; }; unwatch_tv() { :; }
+  ctl() { case "$1" in
+    toggle) catt play_toggle ;;
+    time)   "$CATT" -d "$TV" status 2>/dev/null | awk '/^Time:/{split($2,t,":"); print t[1]*3600+t[2]*60+t[3]}' ;;
+    *)      catt "$@" ;;
+  esac; }
+fi
+
+tv_time() { ctl time; }
 
 wait_for_tv() {   # the TV's Cast service goes away for a minute or two after a session ends
   local i; for i in $(seq 1 30); do
@@ -31,14 +49,15 @@ wait_for_tv() {   # the TV's Cast service goes away for a minute or two after a 
 }
 
 case "$1" in
-  stop|pause|play|status|info|skip|volumemute) catt "$1"; exit ;;
-  toggle)                 catt play_toggle; exit ;;
-  rewind|ffwd|seek)       catt "$1" "${2:-10}"; exit ;;      # seconds (default 10)
-  volume)                 catt volume "${2:-50}"; exit ;;    # 0-100
-  volumeup|volumedown)    catt "$1" "${2:-10}"; exit ;;      # step (default 10)
+  stop)                   unwatch_tv; ctl stop; exit ;;
+  pause|play|toggle|status|skip|volumemute) ctl "$1"; exit ;;
+  info)                   catt info; exit ;;
+  rewind|ffwd|seek)       ctl "$1" "${2:-10}"; exit ;;       # seconds (default 10)
+  volume)                 ctl volume "${2:-50}"; exit ;;     # 0-100
+  volumeup|volumedown)    ctl "$1" "${2:-10}"; exit ;;       # step (default 10)
   back)
-    T=$(tv_time); [ -z "$T" ] && { echo "Nothing playing on TV"; exit 1; }
-    "$CATT" -d "$TV" stop >/dev/null 2>&1
+    T=$(tv_time); [[ "$T" =~ ^[0-9]+$ ]] || { echo "Nothing playing on TV"; exit 1; }
+    unwatch_tv; ctl stop >/dev/null
     R=$("$TABMEDIA" seek "$T"); [ "$R" = ok ] && echo "Back on Mac at $((T/60))m$((T%60))s" || echo "TV stopped (no video in the front tab to resume)"
     exit 0 ;;
   clip) set -- "$(pbpaste | head -n1 | tr -d '[:space:]')"; echo "$1" | grep -qE '^https?://' || { echo "Clipboard has no URL"; exit 1; } ;;
@@ -68,9 +87,10 @@ fi
 
 # 1) yt-dlp sites
 if ! echo "$HOST" | grep -qiE "$PAGE_PLAYER_SITES"; then
-  if catt cast "${SEEK[@]}" "$PAGE" | tail -n 2; then
+  OUT=$(catt cast "${SEEK[@]}" "$PAGE"); RC=$?; echo "$OUT" | tail -n 2   # (piping into tail hid catt's exit code)
+  if [ "$RC" -eq 0 ]; then
     [ "$FROM_TAB" -eq 1 ] && "$TABMEDIA" pause "$APP" >/dev/null
-    exit 0
+    watch_tv; exit 0
   fi
   [ "$FROM_TAB" -eq 0 ] && exit 1
   echo "Not a yt-dlp site — reading the stream from the $APP tab…"
@@ -94,3 +114,4 @@ fi
 "$TABMEDIA" pause "$APP" >/dev/null
 echo "Stream: ${STREAM:0:90}…"; [ -n "$SUBS" ] && echo "Subtitles: ${SUBS:0:90}…"
 catt cast ${SUBS:+-s "$SUBS"} "${TITLE[@]}" "${SEEK[@]}" "$STREAM" | tail -n 1
+[ "${PIPESTATUS[0]}" -eq 0 ] && watch_tv
