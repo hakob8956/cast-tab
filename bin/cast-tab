@@ -11,7 +11,7 @@
 # from the tab (tab-media) and cast directly, with the subtitle track if one was loaded. Page-player sites listed in
 # PAGE_PLAYER_SITES skip step 1. Only the video plays on the TV — Mac screen untouched, full quality.
 
-CONFIG="$HOME/.config/cast-tab/config"; [ -f "$CONFIG" ] && . "$CONFIG"   # CAST_TV=<ip or name> (from: catt scan)
+CONFIG="$HOME/.config/cast-tab/config"; [ -f "$CONFIG" ] && . "$CONFIG"   # CAST_TV=<ip or name> (from: catt scan), CAST_KEEP_AWAKE=0|1
 TV="${CAST_TV:-}"; [ -z "$TV" ] && { echo "No TV configured — put CAST_TV=<ip> in $CONFIG (find it with: catt scan)"; exit 1; }
 CATT="${CATT:-$(command -v catt || echo "$HOME/.local/bin/catt")}"
 TABMEDIA="${TABMEDIA:-$(command -v tab-media || echo "$HOME/.local/bin/tab-media")}"
@@ -26,8 +26,12 @@ CTL="$(dirname "$(readlink -f "$0")")/cast-ctl"
 CATT_PY=$(head -n1 "$CATT" 2>/dev/null | sed -n 's/^#!//p')
 if [[ "$TV" =~ ^[0-9.]+$ ]] && [ -x "$CATT_PY" ] && [ -f "$CTL" ]; then
   ctl() { "$CATT_PY" "$CTL" "$TV" "$@" 2>/dev/null; }
-  # after a cast: stay connected, log to ~/Library/Logs/cast-tab.log, reload the video if the TV's player fails
-  watch_tv()   { unwatch_tv; nohup "$CATT_PY" "$CTL" "$TV" watch </dev/null >/dev/null 2>&1 & }
+  # after a cast: keep the Mac awake and one connection to the TV up, log to ~/Library/Logs/cast-tab.log, load the video
+  # again if the TV's player fails or stalls; if the cast dies, leave the page's video where the TV stopped.
+  # $1 = the stream that was cast, when we know it
+  watch_tv()   { unwatch_tv
+                 CAST_STREAM="$1" CAST_APP="$APP" CAST_PAGE="$TAB_PAGE" CAST_PAGE_TITLE="$TT" CAST_KEEP_AWAKE="${CAST_KEEP_AWAKE:-1}" \
+                   nohup "$CATT_PY" "$CTL" "$TV" watch </dev/null >/dev/null 2>&1 & }
   unwatch_tv() { pkill -f "cast-ctl $TV watch" 2>/dev/null; }
 else
   watch_tv() { :; }; unwatch_tv() { :; }
@@ -40,7 +44,13 @@ fi
 
 tv_time() { ctl time; }
 
+front_browser() {   # → APP. Terminal/Raycast in front → assume Arc
+  APP=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true')
+  echo "$APP" | grep -qE "$BROWSERS" || APP=Arc
+}
+
 wait_for_tv() {   # the TV's Cast service goes away for a minute or two after a session ends
+  [[ "$TV" =~ ^[0-9.]+$ ]] || return 0   # a Cast name, not an address: catt finds the TV itself
   local i; for i in $(seq 1 30); do
     nc -z -w 2 "$TV" 8009 >/dev/null 2>&1 && return 0
     [ "$i" -eq 1 ] && echo "TV Cast service restarting — waiting…"
@@ -58,18 +68,17 @@ case "$1" in
   back)
     T=$(tv_time); [[ "$T" =~ ^[0-9]+$ ]] || { echo "Nothing playing on TV"; exit 1; }
     unwatch_tv; ctl stop >/dev/null
-    R=$("$TABMEDIA" seek "$T"); [ "$R" = ok ] && echo "Back on Mac at $((T/60))m$((T%60))s" || echo "TV stopped (no video in the front tab to resume)"
+    front_browser; R=$("$TABMEDIA" seek "$T" "$APP"); [ "$R" = ok ] && echo "Back on Mac at $((T/60))m$((T%60))s" || echo "TV stopped (no video in the front tab to resume)"
     exit 0 ;;
   clip) set -- "$(pbpaste | head -n1 | tr -d '[:space:]')"; echo "$1" | grep -qE '^https?://' || { echo "Clipboard has no URL"; exit 1; } ;;
 esac
 
-APP=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true')
-echo "$APP" | grep -qE "$BROWSERS" || APP=Arc     # terminal/Raycast in front → assume Arc
+front_browser
 
-FROM_TAB=0
+FROM_TAB=0; TAB_PAGE=""
 if [ -n "$1" ]; then PAGE="$1"
 else
-  PAGE=$(osascript -e "tell application \"$APP\" to get URL of active tab of front window"); FROM_TAB=1
+  PAGE=$(osascript -e "tell application \"$APP\" to get URL of active tab of front window"); FROM_TAB=1; TAB_PAGE="$PAGE"
 fi
 [ -z "$PAGE" ] && { echo "No browser tab URL found"; exit 1; }
 HOST=$(echo "$PAGE" | awk -F/ '{print $3}')
@@ -90,7 +99,7 @@ if ! echo "$HOST" | grep -qiE "$PAGE_PLAYER_SITES"; then
   OUT=$(catt cast "${SEEK[@]}" "$PAGE"); RC=$?; echo "$OUT" | tail -n 2   # (piping into tail hid catt's exit code)
   if [ "$RC" -eq 0 ]; then
     [ "$FROM_TAB" -eq 1 ] && "$TABMEDIA" pause "$APP" >/dev/null
-    watch_tv; exit 0
+    watch_tv ""; exit 0
   fi
   [ "$FROM_TAB" -eq 0 ] && exit 1
   echo "Not a yt-dlp site — reading the stream from the $APP tab…"
@@ -114,4 +123,4 @@ fi
 "$TABMEDIA" pause "$APP" >/dev/null
 echo "Stream: ${STREAM:0:90}…"; [ -n "$SUBS" ] && echo "Subtitles: ${SUBS:0:90}…"
 catt cast ${SUBS:+-s "$SUBS"} "${TITLE[@]}" "${SEEK[@]}" "$STREAM" | tail -n 1
-[ "${PIPESTATUS[0]}" -eq 0 ] && watch_tv
+[ "${PIPESTATUS[0]}" -eq 0 ] && watch_tv "$STREAM"

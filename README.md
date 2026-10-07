@@ -14,6 +14,8 @@ Built for a Samsung TV with Google Cast (S85F), Arc browser and Raycast. Works w
 - `cast-tab clip` — cast the URL in the clipboard
 - subtitles: the track loaded in the page player is attached on the TV
 - TV shows a real title (`Show · Season 4 · Episode 21`)
+- while the TV plays, a background watcher keeps the Mac awake and one Cast connection up, loads the video again at the same position if the TV's player fails or stalls, and reconnects after Wi-Fi drops or Mac sleep
+- if a cast ends early anyway (TV closed the player, paused for 20 min, TV off), the page's video is moved to where the TV stopped — cast the tab again and it resumes there
 
 ### How it finds the stream
 1. **yt-dlp** (bundled in catt) for the ~1800 sites it knows: YouTube, Vimeo, Twitter/X, Reddit, TikTok, Twitch VODs…
@@ -36,7 +38,7 @@ Requirements: macOS, [Homebrew](https://brew.sh), Arc / Chrome / Brave / Edge, T
 Chrome-family (not Arc): enable **View → Developer → Allow JavaScript from Apple Events** so `tab-media` can read the player.
 First run asks macOS to let Terminal/Raycast control the browser — allow it.
 
-Config: `~/.config/cast-tab/config` → `CAST_TV=<ip>` (see `config.example`; `catt scan` lists devices).
+Config: `~/.config/cast-tab/config` → `CAST_TV=<ip>` (see `config.example`; `catt scan` lists devices). Optional: `CAST_KEEP_AWAKE=0` lets the Mac idle-sleep while the TV plays.
 
 ### Raycast
 Settings → search **Script Commands** → **Add Directories** → `~/RaycastScripts/cast-tv`. Then set hotkeys, e.g.
@@ -67,8 +69,10 @@ tab-media urls|info|play|pause|seek <s> [App]   # low-level: talk to the tab's v
 ```
 
 ## Troubleshooting
-- Video stopped in the middle — see `~/Library/Logs/cast-tab.log`: `player error` (reloaded automatically), `frozen`/`BUFFERING` (network), `player closed on the TV` (remote or TV closed it), `TV connection LOST`.
-- `TV Cast service restarting — waiting…` — Samsung drops its Cast service for 1–2 min after a session ends; the script waits up to 90 s.
+- Video stopped in the middle — see `~/Library/Logs/cast-tab.log`: `player error` / `no progress` (video loaded again automatically, at most 3 times in 15 min), `frozen` (a stall, and for how long), `player closed on the TV` (remote, or the TV closed it — it closes a paused player after 20 min), `TV connection lost` / `back` (reconnected), `Mac slept`. When a cast ends early the log also says where the page's video was moved to.
+- Video froze a couple of minutes after the Mac's lid was closed (once in the log) — the TV does not need the Mac to keep playing (checked: 5 min with no connection at all), so that was the stream; what an awake Mac adds is the watcher loading the video again when it stalls or fails. It keeps the Mac from idle-sleeping while the TV plays (`CAST_KEEP_AWAKE=0` turns that off); a closed lid still sleeps it, and the watcher then catches up at wake.
+- `TV refuses the Cast connection` / `TV Cast service restarting — waiting…` — Samsung drops its Cast service for 1–2 min after a session ends. Casting waits up to 90 s for it; the remote commands say so and return.
+- A remote command says `TV did not answer` or `Lost the connection to the TV` — it did not get through; press again.
 - `No stream found in the tab` — DRM, iframe player, or the video never started. Press play in the page and retry.
 - TV shows black/error on a page-player site — the CDN refused the TV (needs cookies/referer). Nothing to do.
 - `Failed to determine cast type` warnings from catt are harmless (Samsung lacks one Chromecast info endpoint); the scripts filter them.
@@ -77,6 +81,7 @@ tab-media urls|info|play|pause|seek <s> [App]   # low-level: talk to the tab's v
 ## Files
 - `bin/cast-tab` — main command
 - `bin/tab-media` — AppleScript/JS bridge to the browser tab's player
-- `bin/cast-ctl` — fast remote (play/pause/seek/volume/status) over a direct Cast socket; used by cast-tab when `CAST_TV` is an IP. `cast-ctl <ip> watch` runs in the background after each cast: logs what the TV does to `~/Library/Logs/cast-tab.log` and reloads the video at the last position if the TV's player fails
+- `bin/cast-ctl` — fast remote (play/pause/seek/volume/status) over a direct Cast socket; used by cast-tab when `CAST_TV` is an IP. `cast-ctl <ip> watch` is the watcher that runs in the background after each cast (YouTube casts play in the TV's own YouTube app and are not watched)
 - `raycast/*.sh` — Raycast script commands (thin wrappers around cast-tab)
 - `install.sh`, `config.example`
+- `test/` — a fake TV (`fake_tv.py`) and tests that run cast-ctl and cast-tab against it through lost connections, stalls, player errors and Mac sleep; no TV or browser needed: `$(head -1 ~/.local/bin/catt | cut -c3-) test/test_cast_ctl.py`, same for `test_cast_tab.py`

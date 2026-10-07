@@ -2,23 +2,46 @@
 # cast-ctl — fast remote for the TV's current Cast session (run with catt's python: it has pychromecast).
 # Usage: cast-ctl <tv-ip> status | time | toggle | play | pause | stop | skip
 #                        rewind [s] | ffwd [s] | seek <s> | volume <0-100> | volumeup [d] | volumedown [d] | volumemute
-#        cast-ctl <tv-ip> watch     stay with the video just cast: log what the TV does, reload it if the player fails
+#        cast-ctl <tv-ip> watch     stay with the video just cast: keep the Mac awake and the Cast connection up, log
+#                                   what the TV does, load the video again if the player fails or stalls
 #
 # catt looks the TV up over HTTP on every call (/setup/eureka_info + cast-type probe, ~1 s each on Samsung) before it
 # opens the Cast socket, so every hotkey took ~2.5 s. This connects straight to port 8009 instead (~0.1 s).
+import logging
 import os
+import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
+from types import SimpleNamespace
 
 import pychromecast
-from pychromecast.config import APP_MEDIA_RECEIVER
+from pychromecast.config import APP_BACKDROP, APP_MEDIA_RECEIVER
+from pychromecast.controllers import BaseController
+from pychromecast.controllers.media import MEDIA_PLAYER_ERROR_CODES
+from pychromecast.error import PyChromecastError, RequestTimeout, UnsupportedNamespace
 from pychromecast.models import CastInfo, HostServiceInfo
+from pychromecast.response_handler import WaitResponse
 
 MEDIA_NS = "urn:x-cast:com.google.cast.media"
-LOG = os.path.expanduser("~/Library/Logs/cast-tab.log")
+LOG = os.environ.get("CAST_TAB_LOG") or os.path.expanduser("~/Library/Logs/cast-tab.log")
+TABMEDIA = os.path.join(os.path.dirname(os.path.realpath(__file__)), "tab-media")
+ACTIVE = ("PLAYING", "PAUSED", "BUFFERING")
+
+# the watcher's patience, in seconds
+POLL = 5         # ask the TV for the player's state this often …
+ANSWER = 3       # … and give it this long to answer
+START = 40       # after the cast, the player has this long to start
+STALL = 45       # no progress for this long (buffering, frozen picture) → load the video again
+GRACE = 30       # a reload has this long to start playing
+AWAY = 60        # out of touch for longer (Mac asleep, Wi-Fi gone) → where the player stopped is a guess: no reload
+GIVE_UP = 600    # nothing heard from the TV for this long → stop watching
+LONG_PAUSE = 1500  # paused for this long (the TV closes its player at 20 min) → the Mac may sleep again
+mono, wall = time.monotonic, time.time   # mono() stands still while the Mac sleeps, wall() does not
 
 
 def die(msg):
@@ -31,46 +54,6 @@ def hms(sec):
     return "%d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60) if sec >= 3600 else "%d:%02d" % (sec // 60, sec % 60)
 
 
-class MediaWaiter:
-    """Set on the next media status (or load failure) from the TV."""
-
-    def __init__(self):
-        self.event = threading.Event()
-
-    def new_media_status(self, status):
-        self.event.set()
-
-    def load_media_failed(self, queue_item_id, error_code):
-        self.event.set()
-
-    def wait(self, timeout=3):
-        ok = self.event.wait(timeout)
-        self.event.clear()
-        return ok
-
-
-def connect(ip, tries=1):
-    info = CastInfo({HostServiceInfo(ip, 8009)}, uuid.uuid5(uuid.NAMESPACE_URL, "cast-tab:" + ip),
-                    "Cast TV", ip, ip, 8009, "cast", "Unknown")
-    cc = pychromecast.get_chromecast_from_cast_info(info, None, tries=tries, retry_wait=5, timeout=5)
-    try:
-        cc.wait(timeout=6)
-    except Exception:
-        die("TV not reachable on %s:8009 (is it on?)" % ip)
-    return cc
-
-
-def main():
-    if len(sys.argv) < 3:
-        die("usage: cast-ctl <tv-ip> <command> [arg]")
-    ip, cmd, arg = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else None)
-    cc = connect(ip, tries=None if cmd == "watch" else 1)   # the watcher reconnects after Wi-Fi blips
-    try:
-        watch(cc) if cmd == "watch" else run(cc, cmd, arg)
-    finally:
-        cc.disconnect(timeout=2)
-
-
 def log(msg):
     with open(LOG, "a") as f:
         f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
@@ -81,184 +64,482 @@ def notify(msg):
                    capture_output=True)
 
 
-class StateLogger:
-    """Logs every player state change the TV pushes (buffering included), and load failures."""
+class Player(BaseController):
+    """The TV's media channel, as the TV words it. (pychromecast's own MediaStatus keeps fields of earlier statuses,
+    forgets why the player went idle, and moves the position on by the Mac's clock — fiction after a sleep or when
+    the TV has stopped answering.)"""
+
+    def __init__(self, talk=False):
+        super().__init__(MEDIA_NS)
+        self.answered, self.lock, self.talk = threading.Event(), threading.Lock(), talk   # talk: log what it does
+        self.session = self.state = self.reason = self.failure = self.tracks = self.said = None
+        self.pos, self.media, self.loading = 0.0, {}, False
+
+    def receive_message(self, _message, data):
+        kind = data.get("type")
+        if kind == "MEDIA_STATUS":
+            st = (data.get("status") or [None])[0]
+            with self.lock:
+                self.loading = bool(st) and (st.get("extendedStatus") or {}).get("playerState") == "LOADING"
+                if not st:   # no media session (any more)
+                    self.session = self.state = None
+                else:
+                    if st.get("mediaSessionId") != self.session:
+                        self.session, self.media, self.tracks = st.get("mediaSessionId"), {}, None
+                    # (a status may carry the media only in part, or not at all)
+                    self.media = {**self.media, **(st.get("media") or (st.get("extendedStatus") or {}).get("media") or {})}
+                    self.state, self.pos = st.get("playerState"), st.get("currentTime", self.pos)
+                    self.tracks = st.get("activeTrackIds", self.tracks)
+                    # the reason comes with the status that turns IDLE; later ones may leave it out
+                    self.reason = (st.get("idleReason") or self.reason) if self.state == "IDLE" else None
+                now = (self.state, self.reason if self.state == "IDLE" else None)
+                if self.talk and now != self.said:
+                    log("  no media session" if not now[0] else
+                        "  %s%s at %s" % (now[0], " (%s)" % now[1] if now[1] else "", hms(self.pos)))
+                    self.said = now
+        elif kind in ("LOAD_FAILED", "LOAD_CANCELLED", "INVALID_REQUEST", "INVALID_PLAYER_STATE", "ERROR"):
+            code, why = data.get("detailedErrorCode"), data.get("reason")
+            if kind != "LOAD_CANCELLED":
+                self.failure = kind
+            if self.talk:
+                log("  TV says %s%s" % (kind, " (%s %s)" % (code, MEDIA_PLAYER_ERROR_CODES.get(code, "")) if code
+                                        else " (%s)" % why if why else ""))
+        else:
+            return False
+        self.answered.set()
+        return True
+
+    def snapshot(self):
+        with self.lock:
+            return SimpleNamespace(state=self.state, reason=self.reason, pos=self.pos or 0, session=self.session,
+                                   media=self.media, url=self.media.get("contentId"), tracks=self.tracks,
+                                   failure=self.failure, loading=self.loading)
+
+
+def reach(ip, timeout=1.5):
+    """None when the TV's Cast port takes connections, else what is wrong."""
+    try:
+        socket.create_connection((ip, 8009), timeout).close()
+    except ConnectionRefusedError:
+        return "TV refuses the Cast connection (off, or its Cast service is restarting — try again in a minute)"
+    except OSError:
+        return "TV not reachable on %s:8009 (is it on?)" % ip
+    return None
+
+
+def open_tv(ip, player=None, listener=None, timeout=4, sender="sender-0"):
+    """One connection attempt: a Chromecast that has told what the TV runs, or None. pychromecast gets no retries of
+    its own (they back off up to 5 minutes, and it then still shows the status from before the drop): callers retry."""
+    info = CastInfo({HostServiceInfo(ip, 8009)}, uuid.uuid5(uuid.NAMESPACE_URL, "cast-tab:" + ip),
+                    "Cast TV", ip, ip, 8009, "cast", "Unknown")
+    cc = pychromecast.get_chromecast_from_cast_info(info, None, tries=1, retry_wait=1, timeout=timeout)
+    if player:
+        cc.register_handler(player)
+    if listener:
+        cc.register_connection_listener(listener)
+    cc.socket_client.source_id = sender
+    cc.start()
+    until = mono() + timeout + 2
+    while not cc.status_event.wait(0.05):
+        if not cc.socket_client.is_alive() or mono() > until:
+            close_tv(cc)
+            return None
+    return cc
+
+
+def close_tv(cc):
+    try:
+        cc.disconnect(timeout=2)
+    except Exception:   # its socket thread is stuck in a connect: a daemon thread, let it be
+        pass
+    sc = cc.socket_client
+    if not sc.is_alive():   # pychromecast leaves these open when the very first connect fails
+        for s in (*sc.socketpair, sc.selector, sc.socket):
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def connect(ip, player, patience=4):
+    """Connection for one remote command. Keeps trying for a few seconds: right after the Mac wakes, Wi-Fi is not up
+    yet and the first try fails at once."""
+    until = mono() + patience
+    while True:
+        why = reach(ip)
+        cc = None if why else open_tv(ip, player)
+        if cc:
+            return cc
+        if mono() > until:
+            die(why or "TV takes the Cast connection but does not answer")
+        time.sleep(0.5)
+
+
+def ask(cc, player):
+    """The player's state as the TV reports it right now; None when it does not answer."""
+    player.answered.clear()
+    try:
+        # not media_controller.update_status(): when the running app has no media channel (it just closed, or the
+        # status is from before a reconnect), that LAUNCHES the default player on the TV. A poll must never do that.
+        cc.media_controller.send_message_nocheck({"type": "GET_STATUS"})
+    except Exception:   # not connected, app gone, socket thread finished
+        return None
+    return player.snapshot() if player.answered.wait(ANSWER) else None
+
+
+def main():
+    if len(sys.argv) < 3:
+        die("usage: cast-ctl <tv-ip> <command> [arg]")
+    ip, cmd, arg = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else None)
+    logging.getLogger("pychromecast").setLevel(logging.CRITICAL)   # connection trouble: we report it ourselves
+    if cmd == "watch":
+        return watch(ip)
+    player = Player()
+    cc = connect(ip, player)
+    try:
+        run(cc, player, cmd, arg)
+    except RequestTimeout:
+        die("TV did not answer")
+    except UnsupportedNamespace:
+        die("TV app has no media controls")
+    except (PyChromecastError, OSError):
+        die("Lost the connection to the TV")
+    except ValueError:
+        die("%s: bad argument %r" % (cmd, arg))
+    finally:
+        close_tv(cc)
+
+
+class TV:
+    """The watcher's connection to the TV, opened anew after every drop."""
+
+    def __init__(self, ip):
+        self.ip, self.cc, self.player, self.lost = ip, None, Player(talk=True), None   # lost: since when, if it is
+
+    def new_connection_status(self, status):   # pychromecast, when a connection breaks (it then tries once itself)
+        if status.status == "LOST":
+            self.dropped()
+
+    def dropped(self, say=True):
+        if self.lost is None:
+            self.lost = mono()
+            if say:
+                log("  TV connection lost")
+
+    @property
+    def up(self):
+        sc = self.cc and self.cc.socket_client
+        return bool(sc and sc.is_alive() and sc.is_connected and not sc.is_stopped)
+
+    @property
+    def app(self):
+        """What the TV runs, as told on this connection (None: not told yet)."""
+        return self.cc and self.cc.socket_client.receiver_controller.status
+
+    def open(self):
+        self.drop()
+        # own sender id: the TV drops a connection when another one arrives under the same id (every hotkey would)
+        self.cc = None if reach(self.ip) else open_tv(self.ip, self.player, self, sender="sender-watch")
+        return self.cc is not None
+
+    def drop(self):
+        if self.cc:
+            close_tv(self.cc)
+        self.cc = None
+
+    def ask(self):
+        return ask(self.cc, self.player) if self.cc else None
+
+
+class Awake:
+    """Holds off the Mac's idle sleep: asleep it can neither see the player fail nor keep its connection to the TV.
+    (Closing the lid still puts it to sleep.)"""
 
     def __init__(self):
-        self.last = None
-        self.load_failed = False
+        self.proc = None
 
-    def new_media_status(self, s):
-        reason = s.idle_reason if s.player_state == "IDLE" else None   # pychromecast keeps the last one around
-        key = (s.player_state, reason)
-        if key != self.last:
-            log("  %s%s at %s" % (s.player_state, " (%s)" % reason if reason else "", hms(s.adjusted_current_time)))
-            self.last = key
-
-    def load_media_failed(self, queue_item_id, error_code):
-        log("  load failed, error %s" % error_code)
-        self.load_failed = True
-
-
-class ConnLogger:
-    def new_connection_status(self, s):
-        log("  TV connection %s" % s.status)
+    def hold(self, on):
+        if on and self.proc is None and os.environ.get("CAST_KEEP_AWAKE", "1") != "0":
+            try:   # -w: gone when we are, however we go
+                self.proc = subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(os.getpid())],
+                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+        elif not on and self.proc:
+            self.proc.terminate()
+            self.proc.wait()
+            self.proc = None
 
 
-def watch(cc):
+def load_again(cc, media, at, tracks):
+    """LOAD what the TV was playing (its own description of the media) at a position."""
+    keep = ("contentId", "contentUrl", "contentType", "streamType", "metadata", "tracks", "textTrackStyle", "customData")
+    media = {k: media[k] for k in keep if media.get(k) is not None}
+    media.setdefault("streamType", "BUFFERED")
+    msg = {"type": "LOAD", "media": media, "currentTime": at, "autoplay": True, "customData": {}}
+    if tracks:
+        msg["activeTrackIds"] = tracks
+    # (not play_media(): that would start the player again if it was closed on the TV a moment ago)
+    cc.media_controller.send_message_nocheck(msg, inc_session_id=True)
+
+
+def sync_page(pos):
+    """Leave the page's video (paused) where the TV stopped, so that casting the tab again resumes there."""
+    app, page = os.environ.get("CAST_APP"), os.environ.get("CAST_PAGE")
+    if not app or not page:   # cast from a URL, not from a tab
+        return
+
+    def tab(*cmd):
+        return subprocess.run([TABMEDIA, *cmd, app], env=dict(os.environ, TAB_URL=page), capture_output=True,
+                              text=True, timeout=20).stdout
+
+    try:
+        info = dict(line.split("=", 1) for line in tab("info").splitlines() if "=" in line)
+        if info.get("paused") != "1" or info.get("title", "").strip() != os.environ.get("CAST_PAGE_TITLE", "").strip():
+            return log("  page left as it is (tab closed, playing, or on another video now)")
+        if tab("settime", str(int(pos))).strip() == "ok":
+            log("  page moved to %s — cast the tab again to resume there" % hms(pos))
+    except Exception as e:
+        log("  page not moved: %s" % e)
+
+
+def watch(ip):
     """Stay with the video cast-tab just started, until it ends or something else is cast. Logs to LOG what the TV
-    does, so a stop in the middle shows why (player error / buffering / TV closed the player / connection lost).
-    On a player error (never caused by the user) the video is loaded again at the last position, up to 3 times."""
+    does, so a stop in the middle shows why (player error / stall / TV closed the player / connection lost).
+
+    Meanwhile the Mac does not idle-sleep (asleep it can watch nothing) and one Cast connection stays up, under its
+    own sender id. After a drop (Wi-Fi, Mac sleep, TV's Cast service) it reconnects every few seconds. The TV plays
+    on by itself without any of this; what the watcher adds is the reload.
+
+    The video is loaded again at the last position, up to 3 times in 15 minutes, when the player reports an error
+    (never caused by the user) or makes no progress for STALL seconds. When the cast ends any other way before the
+    video does, the page's video is moved to where the TV stopped."""
     if os.path.exists(LOG) and os.path.getsize(LOG) > 1_000_000:
         with open(LOG) as f:
             keep = f.readlines()[-3000:]
         with open(LOG, "w") as f:
             f.writelines(keep)
 
-    mc = cc.media_controller
-    waiter, states = MediaWaiter(), StateLogger()
-    mc.register_status_listener(waiter)
-    mc.register_status_listener(states)
-    cc.register_connection_listener(ConnLogger())
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # cast-tab stop / back / the next cast: just leave
+    tv, awake = TV(ip), Awake()
+    try:
+        awake.hold(True)
+        follow(tv, awake)
+    except Exception:
+        log("watch crashed: " + traceback.format_exc().strip().replace("\n", "\n    "))
+    finally:
+        awake.hold(False)
+        tv.drop()
 
-    def poll():
-        if cc.socket_client.is_connected and cc.status and cc.status.app_id == APP_MEDIA_RECEIVER:
-            mc.update_status()
-            waiter.wait()
-        return mc.status
 
-    for _ in range(12):   # cast-tab starts us right after the LOAD; give the player up to 30 s to start
-        s = poll()
-        if s.content_id and s.player_state in ("PLAYING", "PAUSED", "BUFFERING"):
+def follow(tv, awake):
+    want, start = os.environ.get("CAST_STREAM"), mono()
+    while True:   # cast-tab starts us right after the LOAD: wait for that video to show up in the player
+        app = tv.app if tv.up or tv.open() else None
+        if app and app.app_id not in (None, APP_BACKDROP, APP_MEDIA_RECEIVER):
+            return log("%s plays this in its own TV app — nothing to watch" % (app.display_name or app.app_id))
+        p = tv.ask() if app and app.app_id == APP_MEDIA_RECEIVER else None
+        # (a cast over a running video: for a moment the player still shows the old one → wait for ours)
+        if p and p.url and p.state in ACTIVE and (not want or p.url == want or mono() - start > START / 4):
             break
-        time.sleep(2.5)
-    else:
-        return log("watch: nothing playing on the TV's media player, not watching")
+        if mono() - start > (3 * START if p and p.loading else START):   # (still loading: a slow start, not a failed one)
+            return log("watch: nothing playing on the TV's media player, not watching")
+        time.sleep(1)
 
-    url, ctype, title, duration = s.content_id, s.content_type, s.title, s.duration or 0
-    subs = next((t for t in s.subtitle_tracks if t.get("type") == "TEXT" and t.get("trackId") in s.current_subtitle_tracks),
-                None)
-    log("watching %s  [%s … %s]" % (title or "", url[:40], url[-40:]))
+    url, media, tracks = p.url, p.media, p.tracks
+    title, duration = (media.get("metadata") or {}).get("title") or "", media.get("duration") or 0
+    log("watching %s  [%s … %s]" % (title, url[:40], url[-40:]))
 
-    pos, stuck_since, lost_since, reloads, grace_until = s.adjusted_current_time or 0, None, None, [], 0
-    while True:
-        time.sleep(5)
-        if not cc.socket_client.is_connected:
-            lost_since = lost_since or time.time()
-            if time.time() - lost_since > 600:
-                return log("TV unreachable for 10 min (off?) — stop watching")
-            continue
-        lost_since = None
-        if not cc.status or cc.status.app_id != APP_MEDIA_RECEIVER:
-            return log("player closed on the TV at %s (app now: %s) — Back/Home on the remote, or the TV closed it"
-                       % (hms(pos), cc.status.display_name if cc.status else None))
-        s = poll()
-        if s.content_id and s.content_id != url:
-            return log("something else was cast — stop watching")
+    pos, state, seen = p.pos, p.state, wall()   # where, how and when the player was last seen alive
+    moved = heard = tick_m = mono()             # when the position last moved / the TV last answered / this loop ran
+    tick_w, quiet, reloads, grace, paused, napped = wall(), 0, [], 0, None, 0
+    ticking = stuck = reloading = False
 
-        if s.player_state in ("PLAYING", "PAUSED", "BUFFERING"):
-            now = s.adjusted_current_time or pos
-            if s.player_state == "PLAYING" and now - pos < 1:   # "playing" but the picture doesn't move
-                if not stuck_since:
-                    stuck_since = time.time()
-                    log("  frozen: PLAYING but position stuck at %s" % hms(now))
-            elif stuck_since and now - pos >= 1:
-                log("  unfrozen after %ds" % (time.time() - stuck_since))
-                stuck_since = None
-            pos = now
-            continue
+    def end(msg, sync=True, tell=None):
+        log(msg)
+        if sync:
+            sync_page(pos)
+        if tell:
+            notify(tell)
 
-        if s.player_state != "IDLE" or time.time() < grace_until:
-            continue
-        if s.idle_reason == "FINISHED" or (duration and pos > duration - 30):
-            return log("finished")
-        if s.idle_reason != "ERROR" and not states.load_failed:
-            return log("stopped (%s) at %s" % (s.idle_reason, hms(pos)))
+    def over(away):   # played to the end? (after a sleep we were not there to see it)
+        return duration and (pos > duration - 30 or (state != "PAUSED" and away > AWAY and pos + away > duration - 30))
 
-        reloads = [t for t in reloads if time.time() - t < 900]
+    def reload(why):
+        nonlocal reloads, grace, moved, stuck, reloading
+        reloads = [t for t in reloads if mono() - t < 900]
         if len(reloads) >= 3:
-            notify("TV player keeps failing — gave up at %s" % hms(pos))
-            return log("player failed 3 times in 15 min — giving up at %s" % hms(pos))
+            end("player failed 3 times in 15 min — giving up at %s" % hms(pos),
+                tell="TV player keeps failing — gave up at %s" % hms(pos))
+            return False
         at = max(0, pos - 5)
-        log("player error at %s — loading the video again at %s" % (hms(pos), hms(at)))
+        log("%s at %s — loading the video again at %s" % (why, hms(pos), hms(at)))
         notify("TV player failed — resuming at %s" % hms(at))
-        states.load_failed = False
-        reloads.append(time.time())
-        grace_until = time.time() + 30
-        mc.play_media(url, ctype, title=title, current_time=at, stream_type="BUFFERED",
-                      subtitles=subs["trackContentId"] if subs else None,
-                      subtitles_lang=(subs or {}).get("language", "en-US"),
-                      subtitles_mime=(subs or {}).get("trackContentType", "text/vtt"))
+        reloads.append(mono())
+        grace, moved, stuck, reloading, tv.player.failure = mono() + GRACE, mono(), False, True, None
+        try:
+            load_again(tv.cc, media, at, tracks)
+        except Exception as e:
+            log("  could not send it: %s" % (e or type(e).__name__))
+        return True
+
+    while True:
+        time.sleep(POLL)
+        nap = (wall() - tick_w) - (mono() - tick_m)
+        tick_w, tick_m = wall(), mono()
+        if nap > 30:
+            log("  Mac slept %s" % hms(nap + 0.5))
+            tv.drop()   # that socket died meanwhile; don't wait for the heartbeat to find out
+            tv.dropped(say=False)
+            moved, napped = mono(), nap
+        if mono() - heard > GIVE_UP:
+            return end("nothing heard from the TV for %d min (off?) — stop watching, last seen at %s"
+                       % (GIVE_UP // 60, hms(pos)))
+        if not tv.up:
+            tv.dropped()
+            if not tv.open():
+                continue
+        app = tv.app
+        if app is None:   # reconnected a moment ago, the TV has not said yet what it runs
+            continue
+        if tv.lost is not None:
+            log("  TV connection back after %s" % hms(mono() - tv.lost))
+            tv.lost = None
+        away = wall() - seen   # how long since we last saw the player alive
+        if app.app_id != APP_MEDIA_RECEIVER:
+            if over(away):
+                return log("finished (the TV has closed its player since)")
+            what = "player closed on the TV at %s (app now: %s)" % (hms(pos), app.display_name)
+            if away > AWAY:
+                return end(what + " while the Mac was out of touch", tell="TV player closed — last seen at %s" % hms(pos))
+            if state == "PAUSED":
+                return end(what + " — the TV closes a paused player after 20 min",
+                           tell="TV closed the paused player at %s" % hms(pos))
+            return end(what + " — Back/Home on the remote, or the TV closed it")
+
+        p = tv.ask()
+        if p is None:
+            quiet += 1
+            if quiet == 3:   # connected, but the player says nothing: a fresh connection sometimes helps
+                log("  TV's player does not answer — reconnecting")
+                tv.drop()
+                tv.dropped(say=False)
+                quiet = 0
+            continue
+        quiet, heard = 0, mono()
+        if p.url and p.url != url:
+            return end("something else was cast — stop watching", sync=False)
+
+        if p.state in ACTIVE:
+            if p.state == "PAUSED" or abs(p.pos - pos) >= POLL / 5:   # paused, playing on, or someone seeked
+                if stuck:
+                    log("  unfrozen after %ds" % (mono() - moved))
+                ticking = ticking or (p.state == "PLAYING" and state == "PLAYING" and p.pos > pos)
+                moved, stuck = mono(), False
+            elif not stuck and mono() - moved >= 2 * POLL:
+                stuck = True
+                log("  frozen: %s but position stuck at %s" % (p.state, hms(p.pos)))
+            if napped > AWAY and "PAUSED" not in (p.state, state) and p.pos - pos < napped - AWAY:
+                moved = mono() - (STALL - 3 * POLL)   # far behind where it should be: it got stuck while the Mac slept,
+            napped = 0                                # so if it still does not move, don't sit through a whole STALL
+            pos, state, seen, tracks, reloading = p.pos, p.state, wall(), p.tracks, False
+            media, duration = p.media, p.media.get("duration") or duration   # (the length may come after the start)
+            paused = (paused or mono()) if state == "PAUSED" else None        # since when
+            awake.hold(not paused or mono() - paused < LONG_PAUSE)
+            # (a TV that says PLAYING but never moved its clock at all is not trusted to tell a freeze)
+            if stuck and mono() - moved > STALL and mono() > grace and (ticking or p.state == "BUFFERING"):
+                if not reload("no progress for %ds" % (mono() - moved)):
+                    return
+            continue
+
+        # idle, or no media session at all
+        if mono() < grace or (p.loading and mono() < grace + 3 * GRACE):   # our reload is still starting
+            continue
+        if p.reason == "FINISHED" or over(away):
+            return log("finished")
+        failed = p.reason == "ERROR" or p.failure
+        if reloading or (failed and away <= AWAY):
+            if not reload("player error" if failed else "reload did not start"):
+                return
+            continue
+        if away > AWAY:
+            return end("player stopped%s while the Mac was out of touch — last seen at %s"
+                       % (" (%s)" % p.reason if p.reason else "", hms(pos)),
+                       tell="TV player stopped — last seen at %s" % hms(pos))
+        return end("stopped (%s) at %s" % (p.reason, hms(pos)), sync=p.reason != "INTERRUPTED")
 
 
-def run(cc, cmd, arg):
+def run(cc, player, cmd, arg):
     # volume lives on the receiver, works whatever app is running
     if cmd == "volume":
-        cc.set_volume(max(0, min(100, int(arg or 50))) / 100)
+        cc.set_volume(max(0, min(100, int(arg or 50))) / 100, timeout=5)
         return print("🔊 %d" % round(cc.status.volume_level * 100))
     if cmd in ("volumeup", "volumedown"):
         d = int(arg or 10) / 100
-        level = cc.volume_up(d) if cmd == "volumeup" else cc.volume_down(d)
+        level = cc.volume_up(d, timeout=5) if cmd == "volumeup" else cc.volume_down(d, timeout=5)
         return print("%s %d" % ("🔊" if cmd == "volumeup" else "🔉", round(level * 100)))
     if cmd == "volumemute":
         muted = not cc.status.volume_muted
-        cc.set_volume_muted(muted)
+        cc.set_volume_muted(muted, timeout=5)
         return print("🔇 muted" if muted else "🔈 unmuted")
 
-    app = cc.status.app_id if cc.status else None
-    if not app or app == pychromecast.config.APP_BACKDROP:
+    app = cc.status.app_id
+    if not app or app == APP_BACKDROP:
         die("Nothing playing on TV")
     if cmd == "stop":
-        cc.quit_app()
+        try:
+            cc.quit_app(timeout=5)
+        except RequestTimeout:   # no answer is fine if the line dropped: Samsung restarts its Cast service after a session
+            if cc.socket_client.is_connected and cc.status.app_id == app:
+                die("TV did not answer (stop)")
+        except PyChromecastError:
+            pass
         return print("⏹ stopped")
     if MEDIA_NS not in (cc.status.namespaces or []):
         die("TV app %s has no media controls" % cc.status.display_name)
 
-    mc = cc.media_controller
-    waiter = MediaWaiter()
-    mc.register_status_listener(waiter)
-    mc.update_status()
-    if not waiter.wait():
+    p = ask(cc, player)
+    if p is None:
         die("TV did not answer")
-    s = mc.status
-    if s.player_state in (None, "UNKNOWN", "IDLE") or s.media_session_id is None:
-        die("Nothing playing on TV" + (" (last: %s)" % s.idle_reason if s.idle_reason else ""))
+    if p.state not in ACTIVE:
+        die("Nothing playing on TV" + (" (last: %s)" % p.reason if p.reason else ""))
 
-    seekable = bool(s.duration) and s.stream_type == "BUFFERED"
-    pos = s.adjusted_current_time or 0
+    mc, duration = cc.media_controller, p.media.get("duration") or 0
+
+    def send(msg, done=None):
+        mc.send_message_nocheck(dict(msg, mediaSessionId=p.session), inc_session_id=True,
+                                callback_function=done and done.callback)
+        if done:
+            done.wait_response()
 
     def seek(to):
-        if not seekable:
+        if not duration or p.media.get("streamType") != "BUFFERED":
             die("Stream is not seekable")
-        to = max(0, min(to, s.duration - 5))
-        # no resumeState → a paused video stays paused (pychromecast's seek() always resumes)
-        mc._send_command({"type": "SEEK", "currentTime": to}, None)
-        waiter.wait()
+        to = max(0, min(to, duration - 5))
+        player.answered.clear()
+        send({"type": "SEEK", "currentTime": to})   # no resumeState → a paused video stays paused
+        player.answered.wait(ANSWER)
         return to
 
     if cmd == "time":
-        print(int(pos))
+        print(int(p.pos))
     elif cmd == "status":
-        title = (s.title or "").strip()
+        title = ((p.media.get("metadata") or {}).get("title") or "").strip()
         if title:
             print(title)
-        print("%s  %s / %s" % ({"PLAYING": "▶", "PAUSED": "⏸", "BUFFERING": "⏳"}.get(s.player_state, s.player_state),
-                               hms(pos), hms(s.duration)))
+        print("%s  %s / %s" % ({"PLAYING": "▶", "PAUSED": "⏸", "BUFFERING": "⏳"}[p.state], hms(p.pos), hms(duration)))
         print("Volume %d%s" % (round(cc.status.volume_level * 100), " (muted)" if cc.status.volume_muted else ""))
     elif cmd in ("toggle", "play", "pause"):
-        if cmd == "play" or (cmd == "toggle" and s.player_state == "PAUSED"):
-            mc.play()
-            print("▶ %s" % hms(pos))
-        else:
-            mc.pause()
-            print("⏸ %s" % hms(pos))
+        play = cmd == "play" or (cmd == "toggle" and p.state == "PAUSED")
+        send({"type": "PLAY" if play else "PAUSE"}, WaitResponse(5, cmd))
+        print("%s %s" % ("▶" if play else "⏸", hms(p.pos)))
     elif cmd in ("rewind", "ffwd"):
         d = int(arg or 10)
-        print("%s %s" % ("⏪" if cmd == "rewind" else "⏩", hms(seek(pos - d if cmd == "rewind" else pos + d))))
+        print("%s %s" % ("⏪" if cmd == "rewind" else "⏩", hms(seek(p.pos - d if cmd == "rewind" else p.pos + d))))
     elif cmd == "seek":
         print("↪ %s" % hms(seek(int(arg or 0))))
     elif cmd == "skip":
-        seek(s.duration)
+        seek(duration)
         print("⏭ skipped")
     else:
         die("unknown command: %s" % cmd)
