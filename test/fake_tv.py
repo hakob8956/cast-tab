@@ -97,6 +97,8 @@ class FakeTV:
         self.load_time = 3.0
         self.idle_get = None     # GET_STATUS while idle: None = full status, "noreason", "empty" (status: [])
         self.stop_cuts = False   # a receiver STOP is answered by cutting the connection (Samsung's service restart)
+        self.ping_every = 0      # seconds between the PINGs the TV sends each sender (Samsung: 10); 0 = never
+        self.pongs = 0           # PONGs the senders answered with
 
     # ── the box ──────────────────────────────────────────────────────────────────────────────────────────────────
     def start(self):
@@ -122,7 +124,15 @@ class FakeTV:
             with self.lock:
                 self.conns.append(c)
             threading.Thread(target=c.run, daemon=True).start()
+            if self.ping_every:
+                threading.Thread(target=self._ping, args=(c,), daemon=True).start()
         s.close()
+
+    def _ping(self, c):
+        while c in self.conns and self.server:
+            time.sleep(self.ping_every)
+            if c in self.conns and not self.deaf:
+                c.send(BEAT, {"type": "PING"})
 
     def off(self):
         """Power off / Cast service down: nothing listens, every sender is cut."""
@@ -235,6 +245,8 @@ class FakeTV:
         if m.namespace == BEAT:
             if kind == "PING" and not self.deaf:
                 c.send(BEAT, {"type": "PONG"})
+            elif kind == "PONG":
+                self.pongs += 1
             return
         self.got.append((m.namespace, d, m.destination_id))
         if self.deaf:
