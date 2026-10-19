@@ -1,4 +1,6 @@
 # ~/.config/cast-tab/config — sourced by cast-tab
 CAST_TV=192.168.1.50          # TV IP (or Cast name); find it with: catt scan
+# CAST_ATV=192.168.1.60         # Apple TV IP (find it with: atvremote scan) → AirPlay instead of Cast; then: cast-tab pair
+# CAST_USE=cast                 # with both set: cast or airplay (default) — set by: cast-tab use cast|airplay|toggle
 # CAST_KEEP_AWAKE=0             # let the Mac idle-sleep while the TV plays (default: it stays awake, so the
 #                              # watcher can keep the Cast connection up and reload a failed player)

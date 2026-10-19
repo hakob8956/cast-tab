@@ -1,27 +1,54 @@
 #!/bin/bash
-# cast-tab — play the video from the front browser's active tab (or a URL) on the Samsung TV via Google Cast.
+# cast-tab — play the video from the front browser's active tab (or a URL) on the TV: Google Cast (Samsung TV) or
+# AirPlay (Apple TV, when CAST_ATV is set).
 # Usage: cast-tab            video in the front tab → TV, starting where the page is; page video pauses
 #        cast-tab <url>      cast any URL (yt-dlp sites: YouTube, Vimeo, …)
 #        cast-tab clip       cast the URL in the clipboard
 #        cast-tab back       stop the TV and continue in the page from the TV position
 #        cast-tab toggle | play | pause | stop | status | info | skip
 #        cast-tab rewind [s] | ffwd [s] | seek <s> | volume <0-100> | volumeup [d] | volumedown [d] | volumemute
+#        cast-tab pair       pair with the Apple TV (once; PIN shown on the TV)
+#        cast-tab use [airplay|cast|toggle]   which TV, when both are configured (default: AirPlay); no arg: show it
 #
 # How a tab is cast: 1) yt-dlp (via catt) for sites it knows; 2) otherwise the stream the page's player loaded is read
 # from the tab (tab-media) and cast directly, with the subtitle track if one was loaded. Page-player sites listed in
 # PAGE_PLAYER_SITES skip step 1. Only the video plays on the TV — Mac screen untouched, full quality.
 
 CONFIG="$HOME/.config/cast-tab/config"; [ -f "$CONFIG" ] && . "$CONFIG"   # CAST_TV=<ip or name> (from: catt scan)
-TV="${CAST_TV:-}"; [ -z "$TV" ] && { echo "No TV configured — put CAST_TV=<ip> in $CONFIG (find it with: catt scan)"; exit 1; }
+set_conf() {   # KEY VALUE: change that line of the config, keep the others
+  if grep -q "^$1=" "$CONFIG" 2>/dev/null; then sed -i '' "s|^$1=.*|$1=$2|" "$CONFIG"
+  else mkdir -p "$(dirname "$CONFIG")"; echo "$1=$2" >> "$CONFIG"; fi
+}
+
+# CAST_ATV=<Apple TV ip> (from: atvremote scan) → AirPlay. With both configured, CAST_USE picks: airplay (default) or cast
+if [ "$1" = use ]; then
+  CUR=airplay; { [ -z "${CAST_ATV:-}" ] || [ "${CAST_USE:-}" = cast ]; } && CUR=cast
+  case "${2:-}" in
+    "")                           NEW=$CUR ;;
+    toggle)                       [ "$CUR" = airplay ] && NEW=cast || NEW=airplay ;;
+    airplay|apple|appletv|atv)    NEW=airplay ;;
+    cast|chromecast|google)       NEW=cast ;;
+    *) echo "usage: cast-tab use [airplay|cast|toggle]"; exit 2 ;;
+  esac
+  [ "$NEW" = airplay ] && [ -z "${CAST_ATV:-}" ] && { echo "No Apple TV configured — put CAST_ATV=<ip> in $CONFIG"; exit 1; }
+  [ "$NEW" = cast ] && [ -z "${CAST_TV:-}" ] && { echo "No Cast TV configured — put CAST_TV=<ip> in $CONFIG"; exit 1; }
+  [ -n "${2:-}" ] && set_conf CAST_USE "$NEW"
+  [ "$NEW" = airplay ] && echo "📺 AirPlay (Apple TV)" || echo "📺 Chromecast (Google Cast TV)"
+  exit 0
+fi
+
+TV="${CAST_TV:-}"; ATV="${CAST_ATV:-}"
+[ "${CAST_USE:-}" = cast ] && [ -n "$TV" ] && ATV=""   # AirPlay unless switched to Cast
+[ -z "$TV$ATV" ] && { echo "No TV configured — put CAST_TV=<ip> in $CONFIG (find it with: catt scan)"; exit 1; }
 CATT="${CATT:-$(command -v catt || echo "$HOME/.local/bin/catt")}"
 TABMEDIA="${TABMEDIA:-$(command -v tab-media || echo "$HOME/.local/bin/tab-media")}"
 
 # TV's IP can drift (DHCP). If a configured IP doesn't answer on the Cast port, rescan and re-pin when exactly one TV is found.
-if [[ "$TV" =~ ^[0-9.]+$ ]] && ! nc -z -G 1 "$TV" 8009 2>/dev/null; then
+if [ -z "$ATV" ] && [[ "$TV" =~ ^[0-9.]+$ ]] && ! nc -z -G 1 "$TV" 8009 2>/dev/null; then
   FOUND=$("$CATT" scan 2>/dev/null | awk '/ - /{print $1}' | grep -E '^[0-9.]+$')
   if [ "$(echo "$FOUND" | grep -c .)" = 1 ]; then
     echo "TV moved: $TV -> $FOUND (config updated)" >&2
-    TV="$FOUND"; mkdir -p "$(dirname "$CONFIG")"; echo "CAST_TV=$TV" > "$CONFIG"
+    TV="$FOUND"; set_conf CAST_TV "$TV"   # (not the whole file: CAST_ATV / CAST_USE stay)
   fi
 fi
 PAGE_PLAYER_SITES='rezka\.|hdrezka|voidboost|voidviral|kinogo|lordfilm'   # yt-dlp can't do these → go straight to the tab
@@ -33,7 +60,15 @@ catt() { "$CATT" -d "$TV" "$@" 2>&1 | grep -v "Failed to determine cast type"; r
 # first, ~2.5 s per call). It needs an IP and catt's python (has pychromecast); with a Cast name in CAST_TV → catt.
 CTL="$(dirname "$(readlink -f "$0")")/cast-ctl"
 CATT_PY=$(head -n1 "$CATT" 2>/dev/null | sed -n 's/^#!//p')
-if [[ "$TV" =~ ^[0-9.]+$ ]] && [ -x "$CATT_PY" ] && [ -f "$CTL" ]; then
+if [ -n "$ATV" ]; then
+  # Apple TV: atv-ctl (pyatv's python) keeps a helper process that holds the video's AirPlay connection — the Apple TV
+  # stops the video when it closes — and answers the remote commands at once; it does the watching itself
+  ATVREMOTE="$(command -v atvremote || echo "$HOME/.local/bin/atvremote")"
+  ATV_PY=$(head -n1 "$ATVREMOTE" 2>/dev/null | sed -n 's/^#!//p')
+  [ -x "$ATV_PY" ] || { echo "pyatv missing — run install.sh (or: uv tool install pyatv)"; exit 1; }
+  ctl() { "$ATV_PY" "$(dirname "$CTL")/atv-ctl" "$ATV" "$@"; }
+  watch_tv() { :; }; unwatch_tv() { :; }
+elif [[ "$TV" =~ ^[0-9.]+$ ]] && [ -x "$CATT_PY" ] && [ -f "$CTL" ]; then
   ctl() { "$CATT_PY" "$CTL" "$TV" "$@" 2>/dev/null; }
   # after a cast: stay connected, log to ~/Library/Logs/cast-tab.log, reload the video if the TV's player fails
   watch_tv()   { unwatch_tv; nohup "$CATT_PY" "$CTL" "$TV" watch </dev/null >/dev/null 2>&1 & }
@@ -50,6 +85,7 @@ fi
 tv_time() { ctl time; }
 
 wait_for_tv() {   # the TV's Cast service goes away for a minute or two after a session ends
+  [ -n "$ATV" ] && { nc -z -G 2 "$ATV" 7000 2>/dev/null && return 0; echo "Apple TV not reachable at $ATV (is it on the network?)"; return 1; }
   local i; for i in $(seq 1 30); do
     nc -z -w 2 "$TV" 8009 >/dev/null 2>&1 && return 0
     [ "$i" -eq 1 ] && echo "TV Cast service restarting — waiting…"
@@ -60,7 +96,9 @@ wait_for_tv() {   # the TV's Cast service goes away for a minute or two after a 
 case "$1" in
   stop)                   unwatch_tv; ctl stop; exit ;;
   pause|play|toggle|status|skip|volumemute) ctl "$1"; exit ;;
-  info)                   catt info; exit ;;
+  info)                   [ -n "$ATV" ] && { ctl status; exit; }; catt info; exit ;;
+  pair)                   [ -z "$ATV" ] && { echo "Pairing is for an Apple TV: set CAST_ATV=<ip> in $CONFIG"; exit 1; }
+                          ctl pair; exit ;;
   rewind|ffwd|seek)       ctl "$1" "${2:-10}"; exit ;;       # seconds (default 10)
   volume)                 ctl volume "${2:-50}"; exit ;;     # 0-100
   volumeup|volumedown)    ctl "$1" "${2:-10}"; exit ;;       # step (default 10)
@@ -82,7 +120,7 @@ else
 fi
 [ -z "$PAGE" ] && { echo "No browser tab URL found"; exit 1; }
 HOST=$(echo "$PAGE" | awk -F/ '{print $3}')
-echo "Casting: $PAGE"
+echo "Casting${ATV:+ (AirPlay)}: $PAGE"
 
 wait_for_tv || exit 1
 
@@ -93,10 +131,26 @@ if [ "$FROM_TAB" -eq 1 ]; then
   T=$(echo "$INFO" | sed -n 's/^time=//p'); TT=$(echo "$INFO" | sed -n 's/^title=//p')
   [ -n "$T" ] && [ "$T" -gt 5 ] && SEEK=(-t "$T")
 fi
+[ -n "$ATV" ] && [ ${#SEEK[@]} -gt 0 ] && SEEK=(-s "${SEEK[1]}")   # atv-ctl's option for the start position
+
+# Apple TV: yt-dlp only finds the stream (HLS master playlist preferred: the Apple TV picks the quality), then it's
+# loaded like a page stream. A stream URL given directly is loaded as is.
+atv_cast() {
+  local R
+  if echo "$1" | grep -qiE '\.(m3u8|mp4)(\?|$)'; then R="$1"
+  else
+    R=$("$CATT_PY" -m yt_dlp -q --no-warnings --no-playlist -f 'bv*[protocol^=m3u8]/b[ext=mp4]/b' \
+        -O '%(manifest_url,url)s' -O '%(title)s' "$1" 2>&1) || { echo "$R" | tail -n 1; return 1; }
+    [ ${#TITLE[@]} -eq 0 ] && TITLE=(-l "$(echo "$R" | sed -n 2p)")
+  fi
+  ctl load "$(echo "$R" | head -n1)" "${SEEK[@]}" "${TITLE[@]}"
+}
 
 # 1) yt-dlp sites
 if ! echo "$HOST" | grep -qiE "$PAGE_PLAYER_SITES"; then
-  OUT=$(catt cast "${SEEK[@]}" "$PAGE"); RC=$?; echo "$OUT" | tail -n 2   # (piping into tail hid catt's exit code)
+  if [ -n "$ATV" ]; then OUT=$(atv_cast "$PAGE"); RC=$?; echo "$OUT" | tail -n 2
+  else OUT=$(catt cast "${SEEK[@]}" "$PAGE"); RC=$?; echo "$OUT" | tail -n 2   # (piping into tail hid catt's exit code)
+  fi
   if [ "$RC" -eq 0 ]; then
     [ "$FROM_TAB" -eq 1 ] && "$TABMEDIA" pause "$APP" >/dev/null
     watch_tv; exit 0
@@ -107,8 +161,9 @@ fi
 
 # 2) stream straight from the page's player
 [ "$FROM_TAB" -eq 0 ] && { echo "This site must be open in the browser: open it, then run cast-tab without a URL."; exit 1; }
+FILES='\.(mp4|webm|mpd)(\?|$)'; [ -n "$ATV" ] && FILES='\.mp4(\?|$)'   # Apple TV plays no DASH (.mpd) or WebM
 pick() { STREAM=$(echo "$MEDIA" | grep -iE 'manifest\.m3u8|\.m3u8(\?|$)' | head -n1)
-         [ -z "$STREAM" ] && STREAM=$(echo "$MEDIA" | grep -iE '\.(mp4|webm|mpd)(\?|$)' | head -n1)
+         [ -z "$STREAM" ] && STREAM=$(echo "$MEDIA" | grep -iE "$FILES" | head -n1)
          SUBS=$(echo "$MEDIA" | grep -iE '\.(vtt|srt)(\?|$)' | head -n1); }
 MEDIA=$("$TABMEDIA" urls "$APP"); pick
 if [ -z "$STREAM" ]; then
@@ -122,6 +177,10 @@ fi
 
 "$TABMEDIA" pause "$APP" >/dev/null
 echo "Stream: ${STREAM:0:90}…"; [ -n "$SUBS" ] && echo "Subtitles: ${SUBS:0:90}…"
+if [ -n "$ATV" ]; then
+  OUT=$(ctl load "$STREAM" "${SEEK[@]}" "${TITLE[@]}" ${SUBS:+-c "$SUBS"}); RC=$?; echo "$OUT" | tail -n 1
+  exit "$RC"
+fi
 # catt fetches the stream once itself before it tells the TV; the stream's server sometimes leaves that request
 # hanging and catt gives up (nothing has reached the TV yet) → try again
 for TRY in 1 2 3; do

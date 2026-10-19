@@ -2,9 +2,9 @@
 
 Play the video from your browser tab on the TV — only the video, not the screen — with one hotkey, and control it from anywhere on the Mac.
 
-Built for a Samsung TV with Google Cast (S85F), Arc browser and Raycast. Works with any Google Cast receiver (Chromecast, Android/Google TV, Samsung 2025+, LG with Cast) and any Chromium browser.
+Built for a Samsung TV with Google Cast (S85F), Arc browser and Raycast. Works with any Google Cast receiver (Chromecast, Android/Google TV, Samsung 2025+, LG with Cast) and any Chromium browser — or with an **Apple TV over AirPlay** (see [Apple TV](#apple-tv)).
 
-> Why Cast and not AirPlay? Samsung's AirPlay only implements "AirPlay Video V2", an undocumented Apple protocol; every open-source AirPlay sender gets `404` from it. The TV's Google Cast works fine, and Chrome-family browsers speak Cast natively, so everything here is Cast.
+> Why not the Samsung's own AirPlay? It only implements "AirPlay Video V2", an undocumented Apple protocol; every open-source AirPlay sender gets `404` from it. An Apple TV speaks the AirPlay that [pyatv](https://pyatv.dev) does.
 
 ## What it does
 
@@ -41,6 +41,17 @@ First run asks macOS to let Terminal/Raycast control the browser — allow it. I
 
 Config: `~/.config/cast-tab/config` → `CAST_TV=<ip>` (see `config.example`; `catt scan` lists devices). If the TV's IP changes (DHCP), the next cast finds it again and updates the config. Optional: `CAST_KEEP_AWAKE=0` lets the Mac idle-sleep while the TV plays (no watcher reloads, no proxy then).
 
+### Apple TV
+Set `CAST_ATV=<Apple TV ip>` in the config (`atvremote scan` lists it). With both `CAST_ATV` and `CAST_TV` set, AirPlay is used; switch with `cast-tab use cast` / `cast-tab use airplay` / `cast-tab use toggle` (Raycast: **Cast: Switch AirPlay ⇄ Chromecast**), `cast-tab use` shows which one. It's remembered (`CAST_USE` in the config). A video already playing keeps playing on its TV — stop it before switching if you want the remote commands for it. Pair once (needs [pyatv](https://pyatv.dev): `uv tool install pyatv`, done by `install.sh`): `cast-tab pair`, then type the two PINs the TV shows (AirPlay, then Companion). Same commands and hotkeys as with Cast.
+
+Differences from Cast:
+- **The Mac must stay on and on the network while the TV plays.** The Apple TV plays an AirPlay video only while the sender keeps its connection open. A helper (`atv-ctl serve`) holds it and keeps the Mac from idle-sleeping meanwhile; closing the lid sleeps the Mac and stops the video. Short Wi-Fi blips don't matter; when the connection really drops (or the player is stuck for 60 s) the video is loaded again at the same position (at most 3 times in 15 min). Back/Home on the Siri Remote ends it for good. Paused for an hour → stopped, so the Mac can sleep. When a slow stream server makes the player stall, the Apple TV restarts the HLS segment it was in (a few seconds back); the helper seeks it back to where it stalled.
+- The helper stays connected to the Apple TV, so remote commands take ~0.2 s (the first one after an idle hour ~2.5 s). They also work on whatever else the Apple TV plays (Netflix, YouTube app…): play/pause, seek, volume; `stop` pauses those.
+- Volume: up/down only — the Apple TV presses the TV's volume buttons over HDMI-CEC, `volumeup [d]` = d/5 presses (default 2); `volume <n>` and mute aren't available.
+- Streams: HLS (`.m3u8`) and `.mp4`; no DASH (`.mpd`) or WebM. yt-dlp sites (YouTube…) play their HLS stream over AirPlay, not in the TV's app. No title on the TV yet.
+- Subtitles: the Apple TV shows only subtitles that are part of the HLS stream, so the helper serves the TV a playlist of its own from the Mac (a small web server on a random port): the page's stream + its `.vtt`/`.srt` as a WebVTT track, then turns the track on over MRP. HLS streams only; if that fails the video plays without them, and the Siri Remote can still pick them (swipe down → Subtitles).
+- tvOS 26 ignores pyatv's own `play_url` (black screen, HTTP 500 — pyatv issue #2906); `atv-ctl` uses the newer `/command` play queue instead, built on pyatv 0.18 internals — a pyatv update may need a look.
+
 ### Raycast
 Settings → search **Script Commands** → **Add Directories** → `~/RaycastScripts/cast-tv`. Then set hotkeys, e.g.
 
@@ -55,6 +66,7 @@ Settings → search **Script Commands** → **Add Directories** → `~/RaycastSc
 | Cast: Back to Mac | ⌃⌥B |
 | Cast: Clipboard URL | ⌃⌥V |
 | Cast: Status | ⌃⌥I |
+| Cast: Switch AirPlay ⇄ Chromecast | ⌃⌥T |
 
 ## Usage
 
@@ -65,9 +77,12 @@ cast-tab clip             # URL from clipboard
 cast-tab back             # TV → back to the page
 cast-tab toggle | play | pause | stop | status | info | skip
 cast-tab rewind [s] | ffwd [s] | seek <s> | volume <0-100> | volumeup [d] | volumedown [d] | volumemute
+cast-tab pair             # Apple TV: pair once (PINs shown on the TV)
+cast-tab use [airplay|cast|toggle]   # which TV when both are configured (default AirPlay); no arg: show it
 
 tab-media urls|info|frames|play|pause|seek <s>|settime <s>|open <url>|close <ids> [App]   # low-level: the tab's player
 cast-ctl <ip> load <url> [-t type] [-l title] [-s sec] [-c subs] | watch | status | …      # low-level: the TV (catt's python)
+atv-ctl <ip> pair | load <url> [-s sec] [-l title] [-c subs] | status | …                 # low-level: the Apple TV (pyatv's python)
 ```
 
 ## Troubleshooting
@@ -87,6 +102,7 @@ cast-ctl <ip> load <url> [-t type] [-l title] [-s sec] [-c subs] | watch | statu
 - `bin/cast-tab` — main command
 - `bin/tab-media` — AppleScript/JS bridge to the browser tab's player
 - `bin/cast-ctl` — fast remote (play/pause/seek/volume/status), `load` (a stream straight to the TV's player, no probing), the `watch`er that runs in the background after each cast (log, keep-awake, reloads) and the stream proxy that lives inside it; over a direct Cast socket, with one lock around every write (pychromecast writes from two threads otherwise). YouTube casts play in the TV's own app and are not watched
+- `bin/atv-ctl` — the same for an Apple TV over AirPlay (pyatv's python): `pair`, `load`, remote commands, and the `serve` helper that holds the video's connection, watches it and answers the commands over a unix socket (`~/Library/Caches/cast-tab/`)
 - `raycast/*.sh` — Raycast script commands (thin wrappers around cast-tab)
 - `install.sh`, `config.example`
 - `test/` — a fake TV (`fake_tv.py`: scriptable Cast receiver, can lose connections, go deaf, fail or stall its player, ping like Samsung) and tests that run cast-ctl and cast-tab against it (plus a fake browser, a fake catt, a Referer-locked origin server): `$(head -1 ~/.local/bin/catt | cut -c3-) test/test_cast_ctl.py [--soak]`, same for `test_cast_tab.py`. Both bind port 8009: one at a time. `--soak` adds 90 s at real timings with the TV pinging every 10 s.

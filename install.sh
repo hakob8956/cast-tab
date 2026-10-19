@@ -1,11 +1,13 @@
 #!/bin/bash
-# install.sh — set up cast-tab on this Mac: catt (Cast CLI), scripts in ~/.local/bin, Raycast commands, TV config.
+# install.sh — set up cast-tab on this Mac: catt (Cast CLI), pyatv (Apple TV), scripts in ~/.local/bin, Raycast
+# commands, TV config.
 set -e
 REPO="$(cd "$(dirname "$0")" && pwd)"
 BIN="$HOME/.local/bin"; CFG="$HOME/.config/cast-tab/config"; RAY="$HOME/RaycastScripts/cast-tv"
 
 command -v uv >/dev/null || { echo "Installing uv…"; brew install uv; }
 command -v catt >/dev/null || [ -x "$BIN/catt" ] || { echo "Installing catt…"; uv tool install catt --python 3.12; }
+command -v atvremote >/dev/null || [ -x "$BIN/atvremote" ] || { echo "Installing pyatv…"; uv tool install pyatv --python 3.12; }
 
 mkdir -p "$BIN" "$(dirname "$CFG")" "$RAY"
 ln -sf "$REPO/bin/cast-tab" "$BIN/cast-tab"
@@ -14,9 +16,16 @@ cp "$REPO"/raycast/*.sh "$RAY/"
 echo "Scripts linked into $BIN, Raycast commands copied to $RAY"
 
 if [ ! -f "$CFG" ]; then
-  echo; echo "Scanning for Cast devices…"; "$BIN/catt" scan 2>/dev/null | grep -v "Failed to determine" || true
-  read -r -p "TV IP address: " ip
-  printf 'CAST_TV=%s\n' "$ip" > "$CFG"; echo "Saved to $CFG"
+  echo; echo "Looking for Apple TVs…"; "$BIN/atvremote" scan 2>/dev/null | grep -E "Name:|Model/SW:|Address:" || true
+  read -r -p "Apple TV IP address (empty: use a Google Cast TV): " atv
+  if [ -n "$atv" ]; then
+    printf 'CAST_ATV=%s\n' "$atv" > "$CFG"; echo "Saved to $CFG — pairing (PINs appear on the TV):"
+    "$BIN/cast-tab" pair
+  else
+    echo; echo "Scanning for Cast devices…"; "$BIN/catt" scan 2>/dev/null | grep -v "Failed to determine" || true
+    read -r -p "TV IP address: " ip
+    printf 'CAST_TV=%s\n' "$ip" > "$CFG"; echo "Saved to $CFG"
+  fi
 fi
 echo "$PATH" | tr ':' '\n' | grep -qx "$BIN" || echo "NOTE: add $BIN to your PATH (e.g. in ~/.zshrc: export PATH=\"\$HOME/.local/bin:\$PATH\")"
 

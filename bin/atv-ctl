@@ -1,0 +1,814 @@
+#!/usr/bin/env python3
+# atv-ctl — Apple TV over AirPlay: play a stream on it, remote control (run with pyatv's python).
+# Usage: atv-ctl <atv-ip> pair                           pair once: AirPlay + Companion (PIN shown on the TV)
+#        atv-ctl <atv-ip> load <url> [-s sec] [-l title] [-c subs]  play a stream (m3u8 / mp4) on the TV, from <sec>,
+#                                                         with a subtitle file (.vtt / .srt; HLS streams only)
+#        atv-ctl <atv-ip> status | time | toggle | play | pause | stop | skip
+#                         rewind [s] | ffwd [s] | seek <s> | volumeup [d] | volumedown [d]
+#        atv-ctl <atv-ip> serve                           the background process the commands talk to (they start it)
+#
+# The Apple TV plays an AirPlay URL only while the sender keeps the connection open — closing it stops the video.
+# So `serve` holds the video's connection, keeps the Mac from idle-sleeping meanwhile, logs to
+# ~/Library/Logs/cast-tab.log, and loads the video again at the last position if the connection drops or the
+# player gets stuck. It also stays connected to the Apple TV, so remote commands are instant (connecting takes ~2 s);
+# they reach it over a unix socket. It exits after an hour with no video and no command.
+#
+# tvOS 26 no longer plays from pyatv's play_url (/play then /playback-info: HTTP 500, spinner, black screen). Videos go
+# through the newer /command play queue instead, and the player reports back over the AirPlay event channel. Seeking
+# goes through MRP (pyatv's remote control): the queue ignores a start position, and /scrub does nothing.
+#
+# The TV's player shows only subtitles that are part of the HLS stream, so for a separate subtitle file `serve` hands
+# the TV a master playlist of its own (a small web server on this Mac): the page's stream + the file as a WebVTT
+# track, then turns that track on over MRP (as the iPhone's Control Center does).
+import asyncio
+import fcntl
+import json
+import math
+import os
+import plistlib
+import re
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import uuid
+
+import pyatv
+from pyatv.auth.hap_pairing import parse_credentials
+from pyatv.const import DeviceState, PowerState, Protocol
+from pyatv.protocols.airplay import channels
+from pyatv.protocols.airplay.utils import decode_plist_body
+from pyatv.protocols.mrp import messages as mrp_messages, protobuf as mrp_pb
+from pyatv.protocols.mrp.protobuf import CommandInfo_pb2
+from pyatv.protocols.raop.protocols import StreamContext, TimingServer, airplayv2
+from pyatv.storage.file_storage import FileStorage
+from pyatv.support.http import decode_bplist_from_body, http_connect
+from pyatv.support.rtsp import HTTP_PROTOCOL, RtspSession
+
+LOG = os.path.expanduser("~/Library/Logs/cast-tab.log")
+RUN = os.path.expanduser("~/Library/Caches/cast-tab")
+IDLE_EXIT = 3600
+STALL_RELOAD = 60      # player stuck (loading, or "playing" without moving) this long → load the video again
+PAUSED_STOP = 3600     # paused this long → stop it, so the Mac can sleep
+RELOADS = 3            # at most this many reloads in 15 min
+
+
+def die(msg):
+    print(msg)
+    sys.exit(1)
+
+
+def hms(sec):
+    sec = int(sec or 0)
+    return "%d:%02d:%02d" % (sec // 3600, sec % 3600 // 60, sec % 60) if sec >= 3600 else "%d:%02d" % (sec // 60, sec % 60)
+
+
+def log(msg):
+    with open(LOG, "a") as f:
+        f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+
+
+def notify(msg):
+    subprocess.run(["osascript", "-e", 'display notification "%s" with title "Apple TV"' % msg.replace('"', "'")],
+                   capture_output=True)
+
+
+def secs(t):
+    """CMTime ({value, timescale, flags}) → seconds; None if missing or not a number (flags bit 0)."""
+    if isinstance(t, dict) and t.get("timescale") and t.get("flags", 0) & 1:
+        return t["value"] / t["timescale"]
+    return None
+
+
+def fetch(url, limit=None, timeout=15):
+    """GET as the TV's player would: (final url after redirects, body or its first `limit` bytes)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "AppleCoreMedia/1.0.0.23L5 (Apple TV; U; CPU OS 26_4 like Mac OS X)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.geturl(), r.read(limit) if limit else r.read()
+
+
+def first_pts(ts):
+    """Earliest PES timestamp (90 kHz) in the start of an MPEG-TS segment; None if it isn't one."""
+    pts = []
+    for i in range(0, len(ts) - 187, 188):
+        p = ts[i:i + 188]
+        if p[0] != 0x47 or not p[1] & 0x40:   # sync byte, start of a PES
+            continue
+        o = 4 + (1 + p[4] if p[3] & 0x20 else 0)   # past the adaptation field
+        if p[o:o + 3] == b"\x00\x00\x01" and len(p) > o + 13 and p[o + 7] & 0x80:
+            b = p[o + 9:o + 14]
+            pts.append((b[0] >> 1 & 7) << 30 | b[1] << 22 | (b[2] >> 1) << 15 | b[3] << 7 | b[4] >> 1)
+    return min(pts) if pts else None
+
+
+def to_vtt(raw, pts):
+    """A .vtt or .srt file → WebVTT for HLS: cue time 0 = the video's first frame (MPEG-TS timestamp `pts`)."""
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1251")   # Russian .srt files often are
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+    if not text.startswith("WEBVTT"):   # SRT: 00:00:01,000 → 00:00:01.000
+        text = "WEBVTT\n\n" + re.sub(r"(\d+:\d\d:\d\d),(\d\d\d)", r"\1.\2", text)
+    if "X-TIMESTAMP-MAP" not in text:
+        head, _, rest = text.partition("\n")
+        text = "%s\nX-TIMESTAMP-MAP=MPEGTS:%d,LOCAL:00:00:00.000\n%s" % (head, pts, rest)
+    return text
+
+
+async def find(ip, storage):
+    loop = asyncio.get_running_loop()
+    confs = await pyatv.scan(loop, hosts=[ip], timeout=5, storage=storage)
+    if confs:
+        return confs[0]
+    # DHCP may have moved it: look for an Apple TV we are paired with anywhere on the network
+    confs = [c for c in await pyatv.scan(loop, timeout=5, storage=storage)
+             if c.get_service(Protocol.AirPlay) and c.get_service(Protocol.AirPlay).credentials]
+    if len(confs) == 1:
+        log("Apple TV moved: %s -> %s (update CAST_ATV in ~/.config/cast-tab/config)" % (ip, confs[0].address))
+        return confs[0]
+    return None
+
+
+async def pair(ip):
+    loop = asyncio.get_running_loop()
+    storage = FileStorage.default_storage(loop)
+    await storage.load()
+    conf = await find(ip, storage) or die("Apple TV not found at %s (is it on?)" % ip)
+    for proto in (Protocol.AirPlay, Protocol.Companion):   # AirPlay: videos, MRP; Companion: buttons, volume
+        h = await pyatv.pair(conf, proto, loop, storage=storage, name="cast-tab")
+        try:
+            await h.begin()
+            print("%s: enter the PIN shown on the TV: " % proto.name, end="", flush=True)
+            h.pin(int(sys.stdin.readline().strip()))
+            await h.finish()
+            if not h.has_paired:
+                die("%s pairing failed" % proto.name)
+            print("%s paired" % proto.name)
+        finally:
+            await h.close()
+    await storage.save()
+
+
+class EventChannel(channels.EventChannel):
+    """pyatv's event channel answers the TV's messages and drops them; this also hands them to the video."""
+    listener = None
+
+    def handle_received(self):
+        buf = self.buffer
+        while buf and self.listener:
+            req, _, buf = self.parse_request(buf)
+            if req is None:
+                break
+            ev = decode_plist_body(req.body)
+            if isinstance(ev, dict) and isinstance(ev.get("params"), dict) and "data" in ev["params"]:
+                ev = decode_plist_body(ev["params"]["data"])   # player events come wrapped in a /command
+            if isinstance(ev, dict):
+                self.listener(ev)
+        super().handle_received()
+
+
+airplayv2.EventChannel = EventChannel   # AirPlayV2._setup_base opens the channel with this class
+
+
+class Video:
+    """One video on the Apple TV's AirPlay player; it plays as long as this connection is open."""
+
+    QUIET = {"loadedTimeRangesChanged", "playbackBufferFull", "accessLogChanged", "seekableTimeRangesChanged",
+             "timeJumped", "didSeek", "playbackLikelyToKeepUp", "readyToPlay",
+             "currentItemChanged", "playbackBufferEmpty"}
+
+    def __init__(self, conf, url, title, subs=None):
+        self.conf, self.url, self.title, self.subs = conf, url, title, subs
+        self.play = url            # what the TV loads: the stream, or the playlist with the subtitles (Server.with_subs)
+        self.subs_name = None      # the subtitle track's name in that playlist
+        self.state = None          # what the TV reports: loading / playing / paused / …
+        self.pos, self.pos_at, self.rate = 0.0, time.time(), 0.0
+        self.duration = None
+        self.ready = False
+        self.changed = asyncio.Event()
+        self.ended = asyncio.Event()
+        self.end_reason = None     # lost (connection) / closed (by us) / <state the TV ended in>
+        self.last_ok = time.time() # last answer from the TV on this connection
+        self.conn = self.timing = self.proto = None
+        self.tasks = []
+        self.stall_from = None     # where the player ran out of stream (playing → loading)
+        self.seeked = 0.0          # last seek asked for (by a command or by on_rewind)
+        self.on_rewind = None      # called with the position to go back to after a stall rewind
+
+    def position(self):
+        p = self.pos + (time.time() - self.pos_at) * self.rate if self.state == "playing" else self.pos
+        return min(p, self.duration) if self.duration else p
+
+    def set_pos(self, p, rate=None):
+        if p is not None:
+            self.pos, self.pos_at = p, time.time()
+        if rate is not None:
+            self.rate = rate
+
+    async def open(self):
+        svc = self.conf.get_service(Protocol.AirPlay)
+        self.conn = await http_connect(str(self.conf.address), svc.port)
+        # the remote's Back/Home makes the TV close the connection cleanly, with no event first; a network problem
+        # ends it with an error (or not at all: then /feedback times out)
+        conn_lost = self.conn.connection_lost
+        self.conn.connection_lost = lambda exc: (
+            conn_lost(exc), self.end("tv" if exc is None else "lost", "%s" % (exc or "closed by the TV")))
+        self.rtsp = RtspSession(self.conn)
+        ctx = StreamContext()
+        ctx.credentials = parse_credentials(svc.credentials)
+        self.proto = airplayv2.AirPlayV2(ctx, self.rtsp)
+        _, self.timing = await asyncio.get_running_loop().create_datagram_endpoint(
+            TimingServer, local_addr=(self.conn.local_ip, 0))
+        await self.proto._setup_base(self.timing.port)   # pair-verify, SETUP, event channel
+        self.proto.event_channel.get_protocol().listener = self.on_event
+        await self.rtsp.info()
+        await self.rtsp.record()
+        resp = await self.rtsp.setup(body={"streams": [{
+            "type": 130, "controlType": 1, "clientUUID": str(uuid.uuid4()).upper(),
+            "clientTypeUUID": "A6B27562-B43A-4F2D-B75F-82391E250194", "channelID": "AA:BB:CC:DD:EE:FF-RCS-1"}]})
+        self.stream_id = int(decode_bplist_from_body(resp)["streams"][0]["streamID"])
+        self.session_id, self.item = str(uuid.uuid4()).upper(), str(uuid.uuid4()).upper()
+        await self.command({"type": "insertPlayQueueItem",
+                            "item": {"uuid": self.item, "mediaType": "file", "Content-Location": self.play}})
+        await self.command({"type": "setProperty", "property": "isInterestedInDateRange", "value": True,
+                            "item": {"uuid": self.item}})
+        await self.command({"type": "setProperty", "property": "actionAtItemEnd", "value": 1})   # pause at the end
+        await self.set_rate(1.0)
+        self.tasks.append(asyncio.create_task(self.keepalive()))
+
+    async def command(self, cmd):
+        return await self.rtsp.exchange(
+            "POST", uri="/command", protocol=HTTP_PROTOCOL, allow_error=True,
+            headers={"User-Agent": "AirPlay/870.14.1", "X-Apple-ProtocolVersion": "1",
+                     "X-Apple-Session-ID": self.session_id, "X-Apple-StreamID": self.stream_id},
+            body={"params": {"data": plistlib.dumps(cmd, fmt=plistlib.FMT_BINARY, sort_keys=False)}})
+
+    async def set_rate(self, rate):
+        await self.command({"type": "setRate", "rate": rate})
+
+    async def keepalive(self):
+        """/feedback every 2 s, as AirPlay senders do; a failure means the connection is gone (TV stops the video)."""
+        while not self.ended.is_set():
+            try:
+                await self.rtsp.exchange("POST", uri="/feedback")
+                self.last_ok = time.time()
+            except Exception as e:
+                return self.end("lost", "%s" % (e or type(e).__name__))
+            await asyncio.sleep(2)
+
+    def end(self, reason, detail=""):
+        if self.ended.is_set():
+            return
+        self.end_reason, self.end_detail = reason, detail
+        self.ended.set()
+        self.changed.set()
+        self.close()
+
+    def close(self):
+        if not self.ended.is_set():   # closed by us: set before conn.close() calls connection_lost
+            self.end_reason, self.end_detail = "closed", ""
+            self.ended.set()
+            self.changed.set()
+        for t in self.tasks:
+            if t is not asyncio.current_task():
+                t.cancel()
+        if self.proto:
+            self.proto.teardown()
+        if self.conn:
+            self.conn.close()
+        if self.timing:
+            self.timing.close()
+        self.end("closed")
+
+    def on_event(self, ev):
+        kind, name = ev.get("type"), ev.get("name")
+        params = ev.get("params") if isinstance(ev.get("params"), dict) else {}
+        self.last_ok = time.time()
+        if params:   # full player status, sent on state changes
+            self.set_pos(secs(params.get("position")), params.get("rate"))
+            self.duration = secs(params.get("duration")) or self.duration
+            name = params.get("playbackState") or name
+            kind = "playbackState" if name else kind
+        elif kind == "notification":
+            if name in ("timeJumped", "didSeek"):
+                self.set_pos(secs(ev.get("position")), ev.get("rate"))
+            elif name == "readyToPlay":
+                self.ready = True
+            elif name not in self.QUIET:
+                log("  event %s %s" % (name, {k: v for k, v in ev.items() if k not in ("type", "name", "item")}))
+        if kind == "playbackState" and name and name != self.state:
+            self.set_pos(self.position())
+            was, self.state = self.state, name
+            self.rate = 1.0 if name == "playing" else 0.0
+            log("  %s at %s" % (name.upper(), hms(self.position())))
+            if name in ("stopped", "idle", "failed", "error", "ended"):
+                self.end(name)
+            # When the stream's server is slow, the player stalls near the end of an HLS segment and then restarts
+            # that whole segment (seen: 4:41 → 4:36, 6 s segments) → go back to where it stalled. Not after a seek of
+            # ours, and not for the remote's 10 s skip back.
+            if was == "playing" and name == "loading":
+                self.stall_from = self.pos
+            elif was == "loading" and name == "playing" and self.stall_from is not None:
+                back = self.stall_from - self.pos
+                if 1 < back < 9 and time.time() - self.seeked > 10 and self.on_rewind:
+                    log("  went back %ds after the stall — on to %s" % (back, hms(self.stall_from)))
+                    self.seeked = time.time()
+                    self.on_rewind(self.stall_from)
+                self.stall_from = None
+            elif name != "loading":
+                self.stall_from = None
+        self.changed.set()
+
+    async def wait(self, cond, timeout):
+        end = time.time() + timeout
+        while not cond() and not self.ended.is_set() and time.time() < end:
+            self.changed.clear()
+            try:
+                await asyncio.wait_for(self.changed.wait(), end - time.time())
+            except asyncio.TimeoutError:
+                pass
+        return cond()
+
+
+class Server:
+    def __init__(self, ip):
+        self.ip = ip
+        self.atv = self.conf = None
+        self.video = None
+        self.used = time.time()
+        self.load_lock = asyncio.Lock()
+        self.caffeinate = None
+        self.reloads = []
+        self.http, self.http_port = None, 0
+        self.files = {}   # what the web server hands the TV: path → (content type, text)
+
+    # pyatv DeviceListener
+    def connection_lost(self, exc):
+        self.atv = None
+
+    def connection_closed(self):
+        self.atv = None
+
+    async def device(self):
+        if self.atv is None:
+            loop = asyncio.get_running_loop()
+            storage = FileStorage.default_storage(loop)
+            await storage.load()
+            self.conf = await find(self.ip, storage)
+            if not self.conf:
+                raise ConnectionError("Apple TV not found at %s (is it on?)" % self.ip)
+            self.atv = await pyatv.connect(self.conf, loop, storage=storage)
+            self.atv.listener = self
+        return self.atv
+
+    def ours(self):
+        return self.video if self.video and not self.video.ended.is_set() else None
+
+    def keep_awake(self, on):
+        if on and not self.caffeinate:
+            self.caffeinate = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+        elif not on and self.caffeinate:
+            self.caffeinate.terminate()
+            self.caffeinate = None
+
+    async def start(self, url, at, title, subs=None):
+        """Open the video and wait until it plays (then seek to `at`). Returns (ok, message)."""
+        atv = await self.device()
+        v = Video(self.conf, url, title, subs)
+        if subs:
+            try:
+                v.play, v.subs_name = await self.with_subs(url, subs)
+            except Exception as e:
+                log("  subtitles left out: %s" % (e or type(e).__name__))
+        try:
+            await v.open()
+        except BaseException:
+            v.close()
+            raise
+        self.video = v
+        self.keep_awake(True)
+        v.on_rewind = lambda to: v.tasks.append(asyncio.create_task(self.seek_to(to)))
+        if not await v.wait(lambda: v.state == "playing", 30):
+            why = v.end_reason or v.state or "no answer"
+            v.close()
+            if v.play != url:   # the TV did not take the playlist with the subtitles → the stream alone
+                log("  TV player did not start with the subtitles (%s) — playing without them" % why)
+                return await self.start(url, at, title)
+            return False, "TV player did not start (%s) — stream not playable on Apple TV?" % why
+        if at > 5:
+            await atv.remote_control.set_position(int(at))
+            await v.wait(lambda: abs(v.position() - at) < 10, 5)
+        if v.play != url:
+            v.tasks.append(asyncio.create_task(self.show_subs(v)))
+        return True, "▶ playing on Apple TV%s%s" % (" from %s" % hms(at) if at > 5 else "",
+                                                    " with subtitles" if v.play != url else "")
+
+    async def seek_to(self, at):
+        try:
+            await self.atv.remote_control.set_position(int(at))
+        except Exception as e:
+            log("  seek to %s failed: %s" % (hms(at), e or type(e).__name__))
+
+    async def with_subs(self, url, subs):
+        """The stream + the subtitle file as one HLS master playlist, served from this Mac → (its URL for the TV,
+        the track's name)."""
+        final, body = await asyncio.to_thread(fetch, url, None, 10)
+        hls = body.decode("utf-8", "replace")
+        if not hls.startswith("#EXTM3U"):
+            raise ValueError("not an HLS stream")
+        if "TYPE=SUBTITLES" in hls:
+            raise ValueError("the stream has subtitles of its own")
+        master = "#EXT-X-STREAM-INF" in hls
+        media_url, media = final, hls
+        if master:   # a variant tells the length and the start time
+            line = next(l.strip() for l in hls.splitlines() if l.strip() and not l.startswith("#"))
+            media_url, body = await asyncio.to_thread(fetch, urllib.parse.urljoin(final, line), None, 10)
+            media = body.decode("utf-8", "replace")
+        dur = sum(float(d) for d in re.findall(r"#EXTINF:\s*([\d.]+)", media))
+        if not dur:
+            raise ValueError("stream length unknown")
+
+        async def start_pts():   # MPEG-TS segments: the first one's timestamps (fMP4 ones start at 0)
+            seg = next((l.strip() for l in media.splitlines() if l.strip() and not l.startswith("#")), None)
+            if not seg or "#EXT-X-MAP" in media:
+                return 0
+            try:
+                _, head = await asyncio.to_thread(fetch, urllib.parse.urljoin(media_url, seg), 188 * 2000, 5)
+                return first_pts(head) or 0
+            except Exception as e:
+                log("  subtitles: the video's start time unknown (%s) — taking 0" % (e or type(e).__name__))
+                return 0
+
+        pts, (_, raw) = await asyncio.gather(start_pts(), asyncio.to_thread(fetch, subs, None, 10))
+        vtt = to_vtt(raw, pts)
+        lang, name = ("ru", "Русский") if re.search("[а-яА-ЯёЁ]", vtt) else ("en", "English")
+        track = ('#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="%s",LANGUAGE="%s",DEFAULT=YES,AUTOSELECT=YES,'
+                 'FORCED=NO,URI="subs.m3u8"' % (name, lang))
+        if master:   # the same playlist, its URIs made absolute (they were relative to the stream's server)
+            out = []
+            for l in hls.splitlines():
+                l = l.strip()
+                if l and not l.startswith("#"):
+                    l = urllib.parse.urljoin(final, l)
+                elif l.startswith("#EXT-X-STREAM-INF:"):
+                    l += ',SUBTITLES="subs"'
+                out.append(re.sub(r'URI="([^"]+)"', lambda m: 'URI="%s"' % urllib.parse.urljoin(final, m[1]), l))
+            out.insert(1, track)
+        else:
+            out = ["#EXTM3U", track, '#EXT-X-STREAM-INF:BANDWIDTH=4000000,SUBTITLES="subs"', url]
+        sub_list = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:%d" % math.ceil(dur),
+                    "#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-PLAYLIST-TYPE:VOD", "#EXTINF:%.3f," % dur, "subs.vtt",
+                    "#EXT-X-ENDLIST"]
+        if not self.http:
+            self.http = await asyncio.start_server(self.http_client, "0.0.0.0", 0)
+            self.http_port = self.http.sockets[0].getsockname()[1]
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((str(self.conf.address), 7000))   # (no packet sent) the Mac's address the TV can reach
+        mac = s.getsockname()[0]
+        s.close()
+        d = "/%s/" % uuid.uuid4().hex
+        self.files = {d + "master.m3u8": ("application/vnd.apple.mpegurl", "\n".join(out) + "\n"),
+                      d + "subs.m3u8": ("application/vnd.apple.mpegurl", "\n".join(sub_list) + "\n"),
+                      d + "subs.vtt": ("text/vtt; charset=utf-8", vtt)}
+        log("  subtitles: %s, %d lines, video starts at %.2f s" % (name, vtt.count("-->"), pts / 90000))
+        return "http://%s:%d%smaster.m3u8" % (mac, self.http_port, d), name
+
+    async def http_client(self, reader, writer):
+        """The web server for with_subs' playlists. Keep-alive: the TV's player fails (-12884) if the connection it
+        fetched the master playlist on closes instead of serving the next request."""
+        try:
+            while True:
+                req = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 60)
+                method, path = req.decode("latin-1").split(" ")[:2]
+                ctype, text = self.files.get(urllib.parse.urlsplit(path).path, ("text/plain", None))
+                body = text.encode() if text is not None else b"not found"
+                writer.write(("HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n\r\n" % (
+                    "200 OK" if text is not None else "404 Not Found", ctype, len(body))).encode())
+                if method != "HEAD":
+                    writer.write(body)
+                await writer.drain()
+        except Exception:
+            pass   # the player closed the connection (or sent nothing for a minute)
+        finally:
+            writer.close()
+
+    async def show_subs(self, v):
+        """Turn the subtitle track on: the TV's player may leave it off. Over MRP, as the iPhone's Control Center
+        does: ask the TV which language options the video has, enable ours."""
+        name, seen = v.subs_name, "nothing"
+        for _ in range(5):   # the options appear once the player has read the playlists
+            await asyncio.sleep(2)
+            if v.ended.is_set() or not self.atv:
+                return
+            try:
+                mrp = self.atv.remote_control.get(Protocol.MRP)
+                req = mrp_messages.playback_queue_request(mrp.psm.playing.location)
+                mrp_pb.extract_inner(req).includeLanguageOptions = True
+                resp = await mrp.protocol.send_and_receive(req)
+                items = mrp_pb.extract_inner(resp).playbackQueue.contentItems
+                opts = [o for i in items for g in i.availableLanguageOptions for o in g.languageOptions]
+                on = {o.identifier for i in items for o in i.currentLanguageOptions}
+                seen = ", ".join("%s/%s/%s%s" % (o.displayName, o.languageTag, o.type,
+                                                 " (on)" if o.identifier in on else "") for o in opts) or "no options"
+                ours = next((o for o in opts if o.displayName == name), None)
+                if not ours:
+                    continue
+                if ours.identifier in on:
+                    return log("  subtitles on (TV: %s)" % seen)
+                resp = await mrp.protocol.send_and_receive(mrp_messages.command(
+                    CommandInfo_pb2.EnableLanguageOption, languageOption=ours.SerializeToString()))
+                err = mrp_pb.extract_inner(resp).sendError
+                return log("  subtitles: %s (TV: %s)" % ("turned on" if not err else "TV refused (%s)" % err, seen))
+            except Exception as e:
+                return log("  subtitles: could not turn them on over MRP (%s; TV: %s) — remote: swipe down → Subtitles"
+                           % (e or type(e).__name__, seen))
+        log("  subtitles: the TV lists no track named %s (TV: %s) — remote: swipe down → Subtitles" % (name, seen))
+
+    async def load(self, url, at, title, subs=None):
+        async with self.load_lock:
+            if self.ours():
+                old, self.video = self.video, None   # its watcher sees it was replaced and stays quiet
+                old.close()
+            log("loading %s  [%s … %s]%s" % (title or "", url[:40], url[-40:], " + subtitles" if subs else ""))
+            self.reloads = []
+            ok, msg = await self.start(url, at, title, subs)
+            if ok:
+                asyncio.create_task(self.watch(self.video))
+            else:
+                log("  " + msg)
+                self.keep_awake(False)
+            return ok, msg
+
+    async def watch(self, v):
+        """Stay with the video until it ends; load it again when the connection drops or the player gets stuck.
+        Not when the TV stopped it (remote: Back/Home), went to sleep, or the Mac was asleep (the drop is old news)."""
+        stuck_since, paused_since, last = None, None, (v.position(), v.state)
+        while not v.ended.is_set():
+            try:
+                await asyncio.wait_for(v.ended.wait(), 5)
+                break
+            except asyncio.TimeoutError:
+                pass
+            if self.atv and v.state == "playing":   # MRP's position is better than extrapolating from events
+                p = await self.atv.metadata.playing()
+                if p.device_state == DeviceState.Playing and p.position:
+                    v.set_pos(p.position)
+            now = (v.position(), v.state)
+            paused_since = (paused_since or time.time()) if v.state == "paused" else None
+            if v.state == "paused" and v.duration and now[0] >= v.duration - 3:
+                v.close()   # at the end the player pauses (actionAtItemEnd) and would hold on forever
+                break
+            if paused_since and time.time() - paused_since > PAUSED_STOP:
+                log("  paused for %d min — stopping it" % (PAUSED_STOP // 60))
+                v.close()
+                break
+            moving = v.state == "playing" and now[0] - last[0] >= 1
+            if v.state in ("playing", "loading") and not moving:
+                stuck_since = stuck_since or time.time()
+                if time.time() - stuck_since > STALL_RELOAD:
+                    log("  stuck (%s) for %ds at %s" % (v.state, STALL_RELOAD, hms(v.pos)))
+                    v.close()
+                    v.end_reason = "stuck"
+            else:
+                if stuck_since and moving:
+                    log("  moving again after %ds" % (time.time() - stuck_since))
+                stuck_since = None
+            last = now
+
+        if self.video is not v:
+            return   # something else was loaded meanwhile
+        pos, was = v.position(), v.state
+        if v.duration and pos > v.duration - 30:
+            log("finished")
+        elif v.end_reason == "closed":
+            log("stopped at %s" % hms(pos))
+        elif v.end_reason in ("lost", "stuck") and was in ("playing", "loading") and time.time() - v.last_ok < 30:
+            return await self.reload(v, pos)
+        elif v.end_reason == "lost":
+            log("connection lost at %s (%s) — %s" % (hms(pos), v.end_detail, "paused, not reloading" if was == "paused"
+                else "Mac was asleep, not reloading"))
+        else:
+            log("player closed on the TV at %s — remote Back/Home, or the Apple TV closed it%s" % (
+                hms(pos), "" if v.end_reason == "tv" else " (%s)" % v.end_reason))
+        self.keep_awake(False)
+
+    async def reload(self, v, pos):
+        self.reloads = [t for t in self.reloads if time.time() - t < 900]
+        if len(self.reloads) >= RELOADS:
+            notify("Apple TV video keeps failing — gave up at %s" % hms(pos))
+            log("failed %d times in 15 min — giving up at %s" % (RELOADS, hms(pos)))
+            return self.keep_awake(False)
+        self.reloads.append(time.time())
+        at = max(0, pos - 5)
+        log("%s at %s — loading the video again at %s" % (
+            "connection lost (%s)" % v.end_detail if v.end_reason == "lost" else "stuck", hms(pos), hms(at)))
+        for _ in range(24):   # Wi-Fi back within 2 min?
+            try:
+                atv = await self.device()
+                if atv.power.power_state == PowerState.Off:
+                    log("  Apple TV is asleep — not reloading")
+                    return self.keep_awake(False)
+                ok, msg = await self.start(v.url, at, v.title, v.subs)
+                if ok:
+                    notify("Apple TV video resumed at %s" % hms(at))
+                    return asyncio.create_task(self.watch(self.video))
+                log("  " + msg)
+                break
+            except Exception as e:
+                self.atv = None
+                last_err = e
+            await asyncio.sleep(5)
+        else:
+            log("  Apple TV unreachable for 2 min (%s) — giving up" % last_err)
+        notify("Apple TV video stopped at %s" % hms(pos))
+        self.keep_awake(False)
+
+    async def run(self, cmd, arg):
+        """A remote command: (exit code, output)."""
+        if cmd == "load":
+            url, at, title, subs = arg
+            ok, msg = await self.load(url, at, title, subs)
+            return (0 if ok else 1), msg
+        atv = await self.device()
+        v = self.ours()
+        if cmd in ("volumeup", "volumedown"):
+            for _ in range(max(1, round(int(arg or 10) / 5))):   # each press = one step on the TV (HDMI-CEC)
+                await (atv.audio.volume_up() if cmd == "volumeup" else atv.audio.volume_down())
+            return 0, "🔊 up" if cmd == "volumeup" else "🔉 down"
+        if cmd in ("volume", "volumemute"):
+            return 1, "Apple TV can't set or mute the TV's volume — use volume up / down"
+
+        p = await atv.metadata.playing()
+        app = atv.metadata.app.name if atv.metadata.app else None
+        if v:
+            pos, dur, state = (p.position if p.position is not None else v.position()), (p.total_time or v.duration), v.state
+        elif cmd == "time" or p.device_state not in (DeviceState.Playing, DeviceState.Paused,
+                                                    DeviceState.Loading, DeviceState.Seeking):
+            return 1, "Nothing playing on TV" + (" (Apple TV: %s)" % app if app and cmd == "status" else "")
+        else:   # something else on the Apple TV (Netflix, …): the commands go to that app
+            pos, dur, state = p.position or 0, p.total_time, p.device_state.name.lower()
+
+        async def seek(to):
+            if not dur:
+                return None
+            to = max(0, min(to, dur - 5))
+            if v:
+                v.seeked = time.time()   # the TV's jump back is this rewind, not a stall
+            await atv.remote_control.set_position(int(to))
+            return to
+
+        if cmd == "time":
+            return 0, str(int(pos))
+        if cmd == "status":
+            title = v.title if v else " — ".join(x for x in (app, p.title) if x)
+            return 0, "%s%s  %s / %s" % (title + "\n" if title else "",
+                                         {"playing": "▶", "paused": "⏸", "loading": "⏳"}.get(state, state),
+                                         hms(pos), hms(dur))
+        if cmd == "stop":
+            if not v:
+                await atv.remote_control.pause()
+                return 0, "⏸ paused %s (not cast from this Mac)" % app
+            v.close()
+            return 0, "⏹ stopped"
+        if cmd in ("toggle", "play", "pause"):
+            play = cmd == "play" or (cmd == "toggle" and state != "playing")
+            if v:
+                await v.set_rate(1.0 if play else 0.0)
+            else:
+                await (atv.remote_control.play() if play else atv.remote_control.pause())
+            return 0, "%s %s" % ("▶" if play else "⏸", hms(pos))
+        if cmd in ("rewind", "ffwd", "seek", "skip"):
+            d = int(arg or 10)
+            to = {"rewind": pos - d, "ffwd": pos + d, "seek": int(arg or 0), "skip": dur or 0}[cmd]
+            done = await seek(to)
+            if done is None:
+                return 1, "Stream is not seekable"
+            return 0, "⏭ skipped" if cmd == "skip" else "%s %s" % (
+                {"rewind": "⏪", "ffwd": "⏩", "seek": "↪"}[cmd], hms(done))
+        return 1, "unknown command: %s" % cmd
+
+    async def client(self, reader, writer):
+        try:
+            cmd, arg = json.loads(await reader.readline())
+            self.used = time.time()
+            try:
+                rc, out = await self.run(cmd, arg)
+            except Exception as e:
+                rc, out = 1, "Apple TV: %s" % (e or type(e).__name__)
+                if self.atv and not self.ours():
+                    self.atv.close()   # maybe a dead connection: reconnect next time
+                    self.atv = None
+            writer.write(json.dumps([rc, out]).encode() + b"\n")
+            await writer.drain()
+        finally:
+            writer.close()
+
+    async def serve(self, sock):
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 1_000_000:
+            with open(LOG) as f:
+                keep = f.readlines()[-3000:]
+            with open(LOG, "w") as f:
+                f.writelines(keep)
+        if os.path.exists(sock):
+            os.unlink(sock)
+        server = await asyncio.start_unix_server(self.client, sock)
+        try:
+            await self.device()
+        except Exception:
+            pass   # the first command reports it
+        while self.ours() or time.time() - self.used < IDLE_EXIT:
+            await asyncio.sleep(10)
+        server.close()
+        if self.atv:
+            self.atv.close()
+
+
+def sock_path(ip):
+    return os.path.join(RUN, "atv-%s.sock" % ip)
+
+
+def serve(ip):
+    os.makedirs(RUN, exist_ok=True)
+    lock = open(os.path.join(RUN, "atv-%s.lock" % ip), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return   # one is running already
+    asyncio.run(Server(ip).serve(sock_path(ip)))
+
+
+def send(ip, cmd, arg, timeout):
+    """Run a command in the background process (start it first if needed); print its answer."""
+    path = sock_path(ip)
+    if cmd == "load" and os.path.exists(path) and os.path.getmtime(path) < os.path.getmtime(os.path.abspath(__file__)):
+        # the helper runs older code than this file (bin/ was updated); the load replaces its video anyway → new helper
+        subprocess.run(["pkill", "-f", "atv-ctl %s serve" % ip])
+        for _ in range(30):
+            if subprocess.run(["pgrep", "-f", "atv-ctl %s serve" % ip], capture_output=True).returncode:
+                break
+            time.sleep(0.1)
+    started, spawned = time.time(), False
+    while True:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(path)
+            break
+        except OSError:
+            s.close()
+            if time.time() - started > 10:
+                die("Apple TV helper did not start (see %s)" % LOG)
+            if not spawned:
+                spawned = True
+                os.makedirs(RUN, exist_ok=True)
+                subprocess.Popen([sys.executable, os.path.abspath(__file__), ip, "serve"], start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.1)
+    s.settimeout(timeout)
+    s.sendall(json.dumps([cmd, arg]).encode() + b"\n")
+    data = b""
+    try:
+        while not data.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except socket.timeout:
+        die("Apple TV did not answer")
+    if not data:
+        die("Apple TV helper closed the connection (see %s)" % LOG)
+    rc, out = json.loads(data)
+    if out:
+        print(out)
+    sys.exit(rc)
+
+
+def main():
+    if len(sys.argv) < 3:
+        die("usage: atv-ctl <atv-ip> <command> [arg]")
+    ip, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+    if cmd == "pair":
+        asyncio.run(pair(ip))
+    elif cmd == "serve":
+        serve(ip)
+    elif cmd == "load":
+        if not args:
+            die("usage: atv-ctl <atv-ip> load <url> [-s sec] [-l title] [-c subs]")
+        url, at, title, subs, rest = args[0], 0, "", None, args[1:]
+        while rest:
+            opt, val, rest = rest[0], rest[1] if len(rest) > 1 else "", rest[2:]
+            if opt == "-s":
+                at = int(float(val or 0))
+            elif opt == "-l":
+                title = val
+            elif opt == "-c":
+                subs = val or None
+        send(ip, "load", [url, at, title, subs], 120)   # subtitles: their files + maybe a 2nd try without them
+    else:
+        send(ip, cmd, args[0] if args else None, 20)
+
+
+if __name__ == "__main__":
+    main()
